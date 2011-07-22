@@ -4275,6 +4275,7 @@ dependency_error="no"
 plugin_ascent="no"
 plugin_battery="no"
 plugin_bind="no"
+with_ceph="no"
 plugin_conntrack="no"
 plugin_contextswitch="no"
 plugin_cpu="no"
@@ -4574,6 +4575,7 @@ AC_PLUGIN([apple_sensors], [$with_libiokit],   [Apple's hardware sensors])
 AC_PLUGIN([ascent],      [$plugin_ascent],     [AscentEmu player statistics])
 AC_PLUGIN([battery],     [$plugin_battery],    [Battery statistics])
 AC_PLUGIN([bind],        [$plugin_bind],       [ISC Bind nameserver statistics])
+AC_PLUGIN([ceph],        [$with_ceph],         [Ceph Distributed Filesystem monitoring plugin])
 AC_PLUGIN([conntrack],   [$plugin_conntrack],  [nf_conntrack statistics])
 AC_PLUGIN([contextswitch], [$plugin_contextswitch], [context switch statistics])
 AC_PLUGIN([cpufreq],     [$plugin_cpufreq],    [CPU frequency statistics])
