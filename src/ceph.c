@@ -326,6 +326,50 @@ static int ceph_shutdown(void)
 	g_num_daemons = 0;
 }
 
+enum cstate_t {
+	CSTATE_UNCONNECTED = 0,
+	CSTATE_WRITE_REQUEST,
+	CSTATE_READ_AMT,
+	CSTATE_READ_JSON,
+	CSTATE_DONE,
+};
+
+/** Represents a connection to a Ceph daemon */
+struct ceph_daemon_conn
+{
+	/** The daemon we're connecting to */
+	struct ceph_daemon *daemon;
+
+	/** Connection state */
+	enum cstate_t state;
+
+	/** The socket we use to talk to this daemon */ 
+	int asok;
+
+	/** The amount of data remaining to read / write. */
+	uint32_t amt;
+
+	/** Length of the JSON to read */
+	uint32_t json_len;
+
+	/** Buffer containing JSON data */
+	char *json;
+}
+
+static void ceph_daemon_conn_reset(struct ceph_daemon_conn *conn)
+{
+	conn->state = state;
+	if (conn->asok != -1) {
+		int res;
+		RETRY_ON_EINTR(res, close(conn->asok));
+	}
+	conn->asok = -1;
+	conn->amt = 0;
+	conn->json_len = 0;
+	sfree(conn->json);
+	conn->json = NULL;
+}
+
 static int ceph_read_setup(struct ceph_daemon *d, struct pollfd* fds)
 {
 	switch (d->state) {
