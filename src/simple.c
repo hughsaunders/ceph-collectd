@@ -48,30 +48,21 @@
 /** Timeout interval in seconds */
 #define CEPH_TIMEOUT_INTERVAL 2
 
-/** Maximum length of a daemon name */
-#define CEPH_DAEMON_NAME_MAX 64
-
 /** Maximum path length for a UNIX domain socket on this system */
 #define UNIX_DOMAIN_SOCK_PATH_MAX (sizeof(((struct sockaddr_un*)0)->sun_path))
-
-/** Represents a key/value pair that this daemon reports */
-struct ceph_daemon_ds_entry
-{
-	struct data_set_s dset;
-	struct data_source_s dsrc;
-};
 
 /** Represents a Ceph daemon */
 struct ceph_daemon
 {
-	/** Daemon name, like osd0 or mon.a */
-	char name[CEPH_DAEMON_NAME_MAX];
-
 	/** Path to the socket that we use to talk to the ceph daemon */
 	char asok_path[UNIX_DOMAIN_SOCK_PATH_MAX];
 
-	int num_ds_entries;
-	struct ceph_daemon_ds_entry **ds_entries;
+	/** The set of  key/value pairs that this daemon reports
+	 * dset.type		The daemon name
+	 * dset.ds_num		Number of data sources (key/value pairs) 
+	 * dset.ds		Dynamically allocated array of key/value pairs
+	 */
+	struct data_set_s dset;
 };
 
 /** Array of daemons to monitor */
@@ -82,7 +73,7 @@ static int g_num_daemons = 0;
 
 static void ceph_daemon_print(const struct ceph_daemon *d)
 {
-	WARNING("name=%s, asok_path=%s", d->name, d->asok_path);
+	WARNING("name=%s, asok_path=%s", d->dset.type, d->asok_path);
 }
 
 static void ceph_daemons_print(void)
@@ -95,57 +86,28 @@ static void ceph_daemons_print(void)
 
 static void ceph_daemon_free(struct ceph_daemon *d)
 {
-	int i;
-	for (i = 0; i < d->num_ds_entries; ++i) {
-		plugin_unregister_data_set(d->ds_entries[i]->dset.type);
-		sfree(d->ds_entries[i]);
-	}
-	sfree(d->ds_entries);
+	plugin_unregister_data_set(d->dset.type);
+	sfree(d->dset.ds);
 	sfree(d);
 }
 
 static int ceph_daemon_add_ds_entry(struct ceph_daemon *d,
 				    const char *name, int type)
 {
-	struct ceph_daemon_ds_entry *dse;
-	int num_dse = d->num_ds_entries;
-	if (strlen(name) + strlen(d->name) + 1 > DATA_MAX_NAME_LEN)
+	struct data_source_s *ds;
+	if (strlen(name) + 1 > DATA_MAX_NAME_LEN)
 		return -ENAMETOOLONG;
-	struct ceph_daemon_ds_entry **nd = realloc(d->ds_entries,
-		 sizeof(struct ceph_daemon_ds_entry*) * (num_dse + 1));
-	if (!nd)
+	struct data_source_s *ds_array = realloc(d->dset.ds,
+		 sizeof(struct data_source_s) * (d->dset.ds_num + 1));
+	if (!ds_array)
 		return -ENOMEM;
-	d->ds_entries = nd;
-	d->ds_entries[num_dse] = calloc(1, sizeof(struct ceph_daemon_ds_entry));
-	if (!d->ds_entries[num_dse])
-		return -ENOMEM;
-	d->num_ds_entries++;
-	dse = d->ds_entries[num_dse];
-	snprintf(dse->dset.type, DATA_MAX_NAME_LEN, "%s.%s", d->name, name);
-	dse->dset.ds_num = 1;
-	dse->dset.ds = &dse->dsrc;
-	snprintf(dse->dsrc.name, DATA_MAX_NAME_LEN, "value");
-	dse->dsrc.type = type;
-	dse->dsrc.min = NAN;
-	dse->dsrc.max = NAN;
-	plugin_register_data_set(&dse->dset);
+	d->dset.ds = ds_array;
+	ds = &ds_array[d->dset.ds_num++];
+	snprintf(ds->name, DATA_MAX_NAME_LEN, "%s", name);
+	ds->type = type;
+	ds->min = NAN;
+	ds->max = NAN;
 	return 0;
-}
-
-static int dispatch_ds_entry_u64(struct ceph_daemon_ds_entry *dse, uint64_t u64)
-{
-	value_t values[1];
-	value_list_t vl = VALUE_LIST_INIT;
-	sstrncpy(vl.host, hostname_g, sizeof(vl.host));
-	sstrncpy(vl.plugin, "ceph", sizeof(vl.plugin));
-	sstrncpy(vl.type, dse->dset.type, sizeof(vl.type));
-	if (dse->dsrc.type != DS_TYPE_ABSOLUTE) {
-		return -EDOM;
-	}
-	vl.values = values;
-	vl.values_len = 1;
-	values[0].absolute = u64;
-	return plugin_dispatch_values(&vl);
 }
 
 static int cc_handle_str(struct oconfig_item_s *item, char *dest, int dest_len)
@@ -170,14 +132,14 @@ static int ceph_config(oconfig_item_t *ci)
 {
 	int ret, i;
 	struct ceph_daemon *array, *nd, cd;
-	memset(&cd, sizeof(cd), 0);
+	memset(&cd, 0, sizeof(struct ceph_daemon));
 
 	WARNING("entering ceph_config lol!");
 
 	for (i = 0; i < ci->children_num; ++i) {
 		oconfig_item_t *child = ci->children + i;
 		if (strcasecmp("Name", child->key) == 0) {
-			ret = cc_handle_str(child, cd.name, sizeof(cd.name));
+			ret = cc_handle_str(child, cd.dset.type, DATA_MAX_NAME_LEN);
 			if (ret)
 				return ret;
 		}
@@ -191,23 +153,22 @@ static int ceph_config(oconfig_item_t *ci)
 				child->key);
 		}
 	}
-	if (cd.name[0] == '\0') {
+	if (cd.dset.type[0] == '\0') {
 		ERROR("ceph plugin: you must configure a daemon name.\n");
 		return -EINVAL;
 	}
 	else if (cd.asok_path[0] == '\0') {
 		ERROR("ceph plugin(name=%s): you must configure an administrative "
-		      "socket path.\n", cd.name);
+		      "socket path.\n", cd.dset.type);
 		return -EINVAL;
 	}
 	else if (!((cd.asok_path[0] == '/') ||
 	      (cd.asok_path[0] == '.' && cd.asok_path[1] == '/'))) {
 		ERROR("ceph plugin(name=%s): administrative socket paths must begin with "
 		      "'/' or './' Can't parse: '%s'\n",
-		      cd.name, cd.asok_path);
+		      cd.dset.type, cd.asok_path);
 		return -EINVAL;
 	}
-
 	array = realloc(g_daemons,
 			sizeof(struct ceph_daemon *) * (g_num_daemons + 1));
 	if (array == NULL) {
@@ -219,21 +180,29 @@ static int ceph_config(oconfig_item_t *ci)
 	nd = malloc(sizeof(struct ceph_daemon));
 	if (!nd)
 		return ENOMEM;
-	memcpy(nd, &cd, sizeof(cd));
+	memcpy(nd, &cd, sizeof(struct ceph_daemon));
 	g_daemons[g_num_daemons++] = nd;
 	return 0;
 }
 
 static int ceph_init(void)
 {
-	int i;
+	int ret, i;
 	WARNING("ceph_init");
 	ceph_daemons_print();
 
 	for (i = 0; i < g_num_daemons; ++i) {
-		ceph_daemon_add_ds_entry(g_daemons[i], "ultraviolence", DS_TYPE_ABSOLUTE);
+		ceph_daemon_add_ds_entry(g_daemons[i], "ultraviolence", DS_TYPE_GAUGE);
+		ceph_daemon_add_ds_entry(g_daemons[i], "beethovens", DS_TYPE_GAUGE);
 	}
 
+	/* Register a data set for each Ceph daemon */
+	for (i = 0; i < g_num_daemons; ++i) {
+		struct ceph_daemon *d = g_daemons[i];
+		ret = plugin_register_data_set(&d->dset);
+		if (ret)
+			return ret;
+	}
 	return 0;
 }
 
@@ -241,8 +210,7 @@ static int ceph_shutdown(void)
 {
 	int i;
 	for (i = 0; i < g_num_daemons; ++i) {
-		struct ceph_daemon *d = g_daemons[i];
-		ceph_daemon_free(d);
+		ceph_daemon_free(g_daemons[i]);
 	}
 	sfree(g_daemons);
 	g_daemons = NULL;
@@ -251,18 +219,49 @@ static int ceph_shutdown(void)
 	return 0;
 }
 
+static value_t* get_matching_value(const struct data_set_s *dset,
+		   const char *name, value_t *values, int num_values)
+{
+	int i;
+	for (i = 0; i < num_values; ++i) {
+		if (strcmp(dset->ds[i].name, name) == 0) {
+			return values + i;
+		}
+	}
+	return NULL;
+}
+
+static int ceph_daemon_dispatch_values(struct ceph_daemon *d)
+{
+	int ds_num = d->dset.ds_num;
+	value_list_t vl = VALUE_LIST_INIT;
+	value_t values[ds_num];
+	memset(values, 0, sizeof(values));
+
+	sstrncpy(vl.host, hostname_g, sizeof(vl.host));
+	sstrncpy(vl.plugin, "ceph", sizeof(vl.plugin));
+	sstrncpy(vl.type, d->dset.type, sizeof(vl.type));
+	vl.values = values;
+	vl.values_len = ds_num;
+
+	{
+		value_t *uv = get_matching_value(&d->dset, "ultraviolence", values, ds_num);
+		uv->gauge = 101;
+	}
+	{
+		value_t *uv = get_matching_value(&d->dset, "beethovens", values, ds_num);
+		uv->gauge = 404;
+	}
+	return plugin_dispatch_values(&vl);
+}
+
 static int ceph_read(void)
 {
-	uint64_t k = 0;
 	int i, ret;
 	for (i = 0; i < g_num_daemons; ++i) {
-		int j;
-		struct ceph_daemon *d = g_daemons[i];
-		for (j = 0; j < d->num_ds_entries; ++j) {
-			ret = dispatch_ds_entry_u64(d->ds_entries[j], k++);
-			if (ret)
-				return ret;
-		}
+		ret = ceph_daemon_dispatch_values(g_daemons[i]);
+		if (ret)
+			return ret;
 	}
 	return 0;
 }
