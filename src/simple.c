@@ -132,6 +132,22 @@ static int ceph_daemon_add_ds_entry(struct ceph_daemon *d,
 	return 0;
 }
 
+static int dispatch_ds_entry_u64(struct ceph_daemon_ds_entry *dse, uint64_t u64)
+{
+	value_t values[1];
+	value_list_t vl = VALUE_LIST_INIT;
+	sstrncpy(vl.host, hostname_g, sizeof(vl.host));
+	sstrncpy(vl.plugin, "ceph", sizeof(vl.plugin));
+	sstrncpy(vl.type, dse->dset.type, sizeof(vl.type));
+	if (dse->dsrc.type != DS_TYPE_ABSOLUTE) {
+		return -EDOM;
+	}
+	vl.values = values;
+	vl.values_len = 1;
+	values[0].absolute = u64;
+	return plugin_dispatch_values(&vl);
+}
+
 static int cc_handle_str(struct oconfig_item_s *item, char *dest, int dest_len)
 {
 	const char *val;
@@ -225,7 +241,8 @@ static int ceph_shutdown(void)
 {
 	int i;
 	for (i = 0; i < g_num_daemons; ++i) {
-		ceph_daemon_free(g_daemons[i]);
+		struct ceph_daemon *d = g_daemons[i];
+		ceph_daemon_free(d);
 	}
 	sfree(g_daemons);
 	g_daemons = NULL;
@@ -234,9 +251,26 @@ static int ceph_shutdown(void)
 	return 0;
 }
 
+static int ceph_read(void)
+{
+	uint64_t k = 0;
+	int i, ret;
+	for (i = 0; i < g_num_daemons; ++i) {
+		int j;
+		struct ceph_daemon *d = g_daemons[i];
+		for (j = 0; j < d->num_ds_entries; ++j) {
+			ret = dispatch_ds_entry_u64(d->ds_entries[j], k++);
+			if (ret)
+				return ret;
+		}
+	}
+	return 0;
+}
+
 void module_register(void)
 {
 	plugin_register_complex_config("ceph", ceph_config);
 	plugin_register_init("ceph", ceph_init);
+	plugin_register_read("ceph", ceph_read);
 	plugin_register_shutdown("ceph", ceph_shutdown);
 }
