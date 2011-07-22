@@ -42,6 +42,10 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+static const char *HARDCODED_JSON = 
+	"{\"test_perfcounter_1\":{\"element1\":0,\"element2\":0,\"element3\":"
+		"{\"count\":0,\"sum\":0}},\"test_perfcounter_2\":{\"foo\":0,\"bar\":0}}";
+
 /** Polling interval in seconds */
 #define CEPH_POLLING_INTERVAL 5
 
@@ -110,6 +114,7 @@ static int ceph_daemon_add_ds_entry(struct ceph_daemon *d,
 	return 0;
 }
 
+/******* ceph_config *******/
 static int cc_handle_str(struct oconfig_item_s *item, char *dest, int dest_len)
 {
 	const char *val;
@@ -185,20 +190,157 @@ static int ceph_config(oconfig_item_t *ci)
 	return 0;
 }
 
+/******* JSON parsing *******/
+typedef int (*node_handler_t)(void*, json_object*, const char*);
+
+/** Perform a depth-first traversal of the JSON parse tree,
+ * calling node_handler at each leaf node.*/
+static int traverse_json(json_object *jo, char *key, int max_key,
+			node_handler_t handler, void *handler_arg)
+{
+	struct json_object_iter iter;
+	int ret, plen, klen;
+
+	plen = strlen(key);
+	json_object_object_foreachC(jo, iter) {
+		klen = strlen(iter.key);
+		if (plen + klen + 2 > max_key)
+			return -ENAMETOOLONG;
+		if (plen != 0)
+			strcat(key, ".");
+		strcat(key, iter.key);
+		switch (json_object_get_type(iter.val)) {
+		case json_type_object:
+			ret = traverse_json(iter.val, key, max_key,
+					    handler, handler_arg);
+			break;
+		case json_type_array:
+			ret = -ENOTSUP;
+			break;
+		default:
+			ret = handler(handler_arg, iter.val, key);
+			break;
+		}
+		if (ret)
+			return ret;
+		key[plen] = '\0';
+	}
+	return 0;
+}
+
+static int process_json(const char *json,
+			node_handler_t handler, void *handler_arg)
+{
+	json_object *root;
+	char buf[128];
+	buf[0] = '\0';
+
+	root = json_tokener_parse(json);
+	if (!root)
+		return -EDOM;
+	return traverse_json(root, buf, sizeof(buf),
+			     handler, handler_arg);
+}
+
+static int node_handler_define_schema(void *arg, json_object *jo,
+				      const char *key)
+{
+	struct ceph_daemon *d = (struct ceph_daemon *)arg;
+
+	switch (json_object_get_type(jo)) {
+	case json_type_boolean:
+	case json_type_double:
+	case json_type_int:
+		return ceph_daemon_add_ds_entry(d, key, DS_TYPE_GAUGE);
+	default:
+		return -ENOTSUP;
+	}
+}
+
+/** A set of values_t data that we build up in memory while parsing the JSON. */
+struct values_tmp {
+	struct ceph_daemon *d;
+	int values_len;
+	value_t values[0];
+};
+
+static value_t* get_matching_value(const struct data_set_s *dset,
+		   const char *name, value_t *values, int num_values)
+{
+	int i;
+	for (i = 0; i < num_values; ++i) {
+		if (strcmp(dset->ds[i].name, name) == 0) {
+			return values + i;
+		}
+	}
+	return NULL;
+}
+
+static int node_handler_fetch_data(void *arg, json_object *jo,
+				      const char *key)
+{
+	value_t *uv;
+	struct values_tmp *vtmp = (struct values_tmp*)arg;
+
+	switch (json_object_get_type(jo)) {
+	case json_type_boolean:
+	case json_type_double:
+	case json_type_int:
+		uv = get_matching_value(&vtmp->d->dset, key,
+					 vtmp->values, vtmp->values_len);
+		uv->gauge = json_object_get_double(jo);
+		return 0;
+	default:
+		return -ENOTSUP;
+	}
+}
+
+static int ceph_read(void)
+{
+	struct values_tmp *vt, *vtmp = NULL;
+	int i, ret = 0;
+	for (i = 0; i < g_num_daemons; ++i) {
+		value_list_t vl = VALUE_LIST_INIT;
+		struct ceph_daemon *d = g_daemons[i];
+		size_t sz = sizeof(struct values_tmp) +
+				(sizeof(value_t) * d->dset.ds_num);
+		vt = realloc(vtmp, sz); 
+		if (!vt) {
+			ret = -ENOMEM;
+			goto done;
+		}
+		vtmp = vt;
+		memset(vtmp, 0, sz);
+		vtmp->d = d;
+		vtmp->values_len = d->dset.ds_num;
+		ret = process_json(HARDCODED_JSON, node_handler_fetch_data, vtmp);
+		if (ret)
+			goto done;
+		sstrncpy(vl.host, hostname_g, sizeof(vl.host));
+		sstrncpy(vl.plugin, "ceph", sizeof(vl.plugin));
+		sstrncpy(vl.type, d->dset.type, sizeof(vl.type));
+		vl.values = vtmp->values;
+		vl.values_len = vtmp->values_len;
+		ret = plugin_dispatch_values(&vl);
+	}
+done:
+	free(vtmp);
+	return ret;
+}
+
+/******* lifecycle *******/
 static int ceph_init(void)
 {
 	int ret, i;
 	WARNING("ceph_init");
 	ceph_daemons_print();
 
-	for (i = 0; i < g_num_daemons; ++i) {
-		ceph_daemon_add_ds_entry(g_daemons[i], "ultraviolence", DS_TYPE_GAUGE);
-		ceph_daemon_add_ds_entry(g_daemons[i], "beethovens", DS_TYPE_GAUGE);
-	}
-
-	/* Register a data set for each Ceph daemon */
+	/* Register the data set for each Ceph daemon */
 	for (i = 0; i < g_num_daemons; ++i) {
 		struct ceph_daemon *d = g_daemons[i];
+		ret = process_json(HARDCODED_JSON, node_handler_define_schema, d);
+		if (ret)
+			return ret;
 		ret = plugin_register_data_set(&d->dset);
 		if (ret)
 			return ret;
@@ -216,53 +358,6 @@ static int ceph_shutdown(void)
 	g_daemons = NULL;
 	g_num_daemons = 0;
 	WARNING("finished ceph_shutdown");
-	return 0;
-}
-
-static value_t* get_matching_value(const struct data_set_s *dset,
-		   const char *name, value_t *values, int num_values)
-{
-	int i;
-	for (i = 0; i < num_values; ++i) {
-		if (strcmp(dset->ds[i].name, name) == 0) {
-			return values + i;
-		}
-	}
-	return NULL;
-}
-
-static int ceph_daemon_dispatch_values(struct ceph_daemon *d)
-{
-	int ds_num = d->dset.ds_num;
-	value_list_t vl = VALUE_LIST_INIT;
-	value_t values[ds_num];
-	memset(values, 0, sizeof(values));
-
-	sstrncpy(vl.host, hostname_g, sizeof(vl.host));
-	sstrncpy(vl.plugin, "ceph", sizeof(vl.plugin));
-	sstrncpy(vl.type, d->dset.type, sizeof(vl.type));
-	vl.values = values;
-	vl.values_len = ds_num;
-
-	{
-		value_t *uv = get_matching_value(&d->dset, "ultraviolence", values, ds_num);
-		uv->gauge = 101;
-	}
-	{
-		value_t *uv = get_matching_value(&d->dset, "beethovens", values, ds_num);
-		uv->gauge = 404;
-	}
-	return plugin_dispatch_values(&vl);
-}
-
-static int ceph_read(void)
-{
-	int i, ret;
-	for (i = 0; i < g_num_daemons; ++i) {
-		ret = ceph_daemon_dispatch_values(g_daemons[i]);
-		if (ret)
-			return ret;
-	}
 	return 0;
 }
 
