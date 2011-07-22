@@ -54,6 +54,13 @@
 /** Maximum path length for a UNIX domain socket on this system */
 #define UNIX_DOMAIN_SOCK_PATH_MAX (sizeof(((struct sockaddr_un*)0)->sun_path))
 
+/** Represents a key/value pair that this daemon reports */
+struct ceph_daemon_ds_entry
+{
+	struct data_set_s dset;
+	struct data_source_s dsrc;
+};
+
 /** Represents a Ceph daemon */
 struct ceph_daemon
 {
@@ -63,12 +70,8 @@ struct ceph_daemon
 	/** Path to the socket that we use to talk to the ceph daemon */
 	char asok_path[UNIX_DOMAIN_SOCK_PATH_MAX];
 
-	/** Number of key/value pairs this daemon reports */
-	int data_set_len;
-
-	/** Represents a key/value pair that this daemon reports */
-	struct data_set_s *data_sets;
-	struct data_source_s *data_sources;
+	int num_ds_entries;
+	struct ceph_daemon_ds_entry **ds_entries;
 };
 
 /** Array of daemons to monitor */
@@ -77,17 +80,56 @@ static struct ceph_daemon **g_daemons = NULL;
 /** Number of elements in g_daemons */
 static int g_num_daemons = 0;
 
-static void ceph_print_daemon_state(const struct ceph_daemon *d)
+static void ceph_daemon_print(const struct ceph_daemon *d)
 {
 	WARNING("name=%s, asok_path=%s", d->name, d->asok_path);
 }
 
-static void ceph_print_daemons_state(void)
+static void ceph_daemons_print(void)
 {
 	int i;
 	for (i = 0; i < g_num_daemons; ++i) {
-		ceph_print_daemon_state(g_daemons[i]);
+		ceph_daemon_print(g_daemons[i]);
 	}
+}
+
+static void ceph_daemon_free(struct ceph_daemon *d)
+{
+	int i;
+	for (i = 0; i < d->num_ds_entries; ++i) {
+		plugin_unregister_data_set(d->ds_entries[i]->dset.type);
+		sfree(d->ds_entries[i]);
+	}
+	sfree(d->ds_entries);
+	sfree(d);
+}
+
+static int ceph_daemon_add_ds_entry(struct ceph_daemon *d,
+				    const char *name, int type)
+{
+	struct ceph_daemon_ds_entry *dse;
+	int num_dse = d->num_ds_entries;
+	if (strlen(name) + strlen(d->name) + 1 > DATA_MAX_NAME_LEN)
+		return -ENAMETOOLONG;
+	struct ceph_daemon_ds_entry **nd = realloc(d->ds_entries,
+		 sizeof(struct ceph_daemon_ds_entry*) * (num_dse + 1));
+	if (!nd)
+		return -ENOMEM;
+	d->ds_entries = nd;
+	d->ds_entries[num_dse] = calloc(1, sizeof(struct ceph_daemon_ds_entry));
+	if (!d->ds_entries[num_dse])
+		return -ENOMEM;
+	d->num_ds_entries++;
+	dse = d->ds_entries[num_dse];
+	snprintf(dse->dset.type, DATA_MAX_NAME_LEN, "%s.%s", d->name, name);
+	dse->dset.ds_num = 1;
+	dse->dset.ds = &dse->dsrc;
+	snprintf(dse->dsrc.name, DATA_MAX_NAME_LEN, "value");
+	dse->dsrc.type = type;
+	dse->dsrc.min = NAN;
+	dse->dsrc.max = NAN;
+	plugin_register_data_set(&dse->dset);
+	return 0;
 }
 
 static int cc_handle_str(struct oconfig_item_s *item, char *dest, int dest_len)
@@ -168,8 +210,14 @@ static int ceph_config(oconfig_item_t *ci)
 
 static int ceph_init(void)
 {
+	int i;
 	WARNING("ceph_init");
-	ceph_print_daemons_state();
+	ceph_daemons_print();
+
+	for (i = 0; i < g_num_daemons; ++i) {
+		ceph_daemon_add_ds_entry(g_daemons[i], "ultraviolence", DS_TYPE_ABSOLUTE);
+	}
+
 	return 0;
 }
 
@@ -177,8 +225,7 @@ static int ceph_shutdown(void)
 {
 	int i;
 	for (i = 0; i < g_num_daemons; ++i) {
-		struct ceph_daemon *d = g_daemons[i];
-		sfree(d);
+		ceph_daemon_free(g_daemons[i]);
 	}
 	sfree(g_daemons);
 	g_daemons = NULL;
