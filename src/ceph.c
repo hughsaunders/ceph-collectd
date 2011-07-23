@@ -25,6 +25,7 @@
 #include "common.h"
 #include "plugin.h"
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <json/json.h>
@@ -47,68 +48,31 @@
 		if (expr < 0) { \
 			if (errno == EINTR) \
 				continue; \
-			ret = errno; \
+			ret = -errno; \
 			break; \
 		} \
 		ret = 0; \
 		break; \
 	}
 
-/** Polling interval in seconds */
-#define CEPH_POLLING_INTERVAL 5
-
 /** Timeout interval in seconds */
-#define CEPH_TIMEOUT_INTERVAL 2
-
-/** Maximum length of a daemon name */
-#define CEPH_DAEMON_NAME_MAX 64
+#define CEPH_TIMEOUT_INTERVAL 1
 
 /** Maximum path length for a UNIX domain socket on this system */
 #define UNIX_DOMAIN_SOCK_PATH_MAX (sizeof(((struct sockaddr_un*)0)->sun_path))
 
-enum cstate_t {
-	CSTATE_UNCONNECTED = 0,
-	CSTATE_WRITE_REQUEST,
-	CSTATE_READ_AMT,
-	CSTATE_READ_JSON,
-	CSTATE_DONE,
-};
-
-enum ceph_io_action_t {
-	CIO_ACTION_DEFINE_SCHEMA,
-	CIO_ACTION_REPORT_DATA,
-}
-
-/** Represents a Ceph daemon */
+/******* ceph_daemon *******/
 struct ceph_daemon
 {
-	/** Daemon name, like osd0 or mon.a */
-	char name[CEPH_DAEMON_NAME_MAX];
-
 	/** Path to the socket that we use to talk to the ceph daemon */
 	char asok_path[UNIX_DOMAIN_SOCK_PATH_MAX];
 
-	/** Connection state */
-	enum cstate_t state;
-
-	/** The socket we use to talk to this daemon */ 
-	int asok;
-
-	/** The amount of data remaining to read / write. */
-	uint32_t amt;
-
-	/** Length of the JSON to read */
-	uint32_t json_len;
-
-	/** Buffer containing JSON data */
-	char *json;
-
-	/** Number of key/value pairs this daemon reports */
-	int data_set_len;
-
-	/** Represents a key/value pair that this daemon reports */
-	struct data_set_s *data_sets;
-	struct data_source_s *data_sources;
+	/** The set of  key/value pairs that this daemon reports
+	 * dset.type		The daemon name
+	 * dset.ds_num		Number of data sources (key/value pairs) 
+	 * dset.ds		Dynamically allocated array of key/value pairs
+	 */
+	struct data_set_s dset;
 };
 
 /** Array of daemons to monitor */
@@ -117,157 +81,107 @@ static struct ceph_daemon **g_daemons = NULL;
 /** Number of elements in g_daemons */
 static int g_num_daemons = 0;
 
-/** Wipe daemon I/O state */
-static void daemon_wipe_io_state(struct ceph_daemon *d, enum cstate_t state)
+static void ceph_daemon_print(const struct ceph_daemon *d)
 {
-	d->state = state;
-	if (d->asok != -1) {
-		int res;
-		RETRY_ON_EINTR(res, close(d->asok));
+	WARNING("name=%s, asok_path=%s", d->dset.type, d->asok_path);
+}
+
+static void ceph_daemons_print(void)
+{
+	int i;
+	for (i = 0; i < g_num_daemons; ++i) {
+		ceph_daemon_print(g_daemons[i]);
 	}
-	d->asok = -1;
-	d->amt = 0;
-	d->json_len = 0;
-	sfree(d->json);
-	d->json = NULL;
 }
 
-static int define_schema(const char *name, json_object *jo)
+static void ceph_daemon_free(struct ceph_daemon *d)
 {
-
+	plugin_unregister_data_set(d->dset.type);
+	sfree(d->dset.ds);
+	sfree(d);
 }
 
-/** Depth-first traversal of the JSON parse tree.
- */
-static int traverse_json(char *prefix, int max_prefix, json_object *jo,
-			 enum ceph_io_action_t act)
+static int ceph_daemon_add_ds_entry(struct ceph_daemon *d,
+				    const char *name, int type)
 {
-	struct json_object_iter iter;
-	int ret, plen, klen;
+	struct data_source_s *ds;
+	if (strlen(name) + 1 > DATA_MAX_NAME_LEN)
+		return -ENAMETOOLONG;
+	struct data_source_s *ds_array = realloc(d->dset.ds,
+		 sizeof(struct data_source_s) * (d->dset.ds_num + 1));
+	if (!ds_array)
+		return -ENOMEM;
+	d->dset.ds = ds_array;
+	ds = &ds_array[d->dset.ds_num++];
+	snprintf(ds->name, DATA_MAX_NAME_LEN, "%s", name);
+	ds->type = type;
+	ds->min = NAN;
+	ds->max = NAN;
+	return 0;
+}
 
-	plen = strlen(prefix);
-	json_object_object_foreachC(jo, iter) {
-		klen = strlen(iter.key);
-		if (plen + klen + 2 > max_prefix)
-			return -ENAMETOOLONG;
-		strcat(prefix, ".");
-		strcat(prefix, iter.key);
-		switch (act) {
-		case CIO_ACTION_DEFINE_SCHEMA
-			ret = define_schema(prefix, iter.val);
-			if (ret)
-				return ret;
-			break;
-		case CIO_ACTION_REPORT_DATA
-			report_data(prefix, iter.val);
-			break;
-		default:
-			break;
-		}
-
-json_object_get_type(iter.val)
-		switch (json_object_get_type(iter.val)) {
-		case json_type_boolean:
-		case json_type_double:
-		case json_type_int:
-		case json_type_string: {
-			const char *vstr = json_object_get_string(iter.val);
-			set_kv(prefix, vstr);
-			break;
-		}
-		case json_type_object:
-			ret = flatten_json_impl(prefix, max_prefix, iter.val);
-			if (ret)
-				return ret;
-			break;
-		case json_type_array:
-			return -ENOTSUP;
-		}
-		prefix[plen] = '\0';
+/******* ceph_config *******/
+static int cc_handle_str(struct oconfig_item_s *item, char *dest, int dest_len)
+{
+	const char *val;
+	if (item->values_num != 1) {
+		return -ENOTSUP; 
+	}
+	if (item->values[0].type != OCONFIG_TYPE_STRING) {
+		return -ENOTSUP; 
+	}
+	val = item->values[0].value.string;
+	if (snprintf(dest, dest_len, "%s", val) > (dest_len - 1)) {
+		ERROR("ceph plugin: configuration parameter '%s' is too long.\n",
+		      item->key);
+		return -ENAMETOOLONG;
 	}
 	return 0;
 }
 
-static int process_json(const struct ceph_daemon *d, enum ceph_io_action_t act)
-{
-	json_object *root;
-	char buf[128];
-	snprintf(buf, sizeof(buf), "%s", d->name);
-
-	root = json_tokener_parse(d->json_buf);
-	if (!root)
-		return -EDOM;
-	return traverse_json(buf, sizeof(buf), root);
-}
-
-/** Returns the difference between two struct timevals in milliseconds.
- * On overflow, we return max/min int.
- */
-static int milli_diff(const struct timeval *t1, const struct timeval *t2)
-{
-	int64_t ret;
-	int sec_diff = t1.tv_sec - t2.tv_sec;
-	int usec_diff = t1.tv_usec - t2.tv_usec;
-	ret = usec_diff / 1000;
-	ret += (sec_diff * 1000);
-	if (ret > MAX_INT)
-		return MAX_INT;
-	else if (ret < MIN_INT)
-		return MIN_INT;
-	return (int)ret;
-}
-
-/** Ceph configuration callback.
- *
- * This will be called once for each <Plugin /> block parsed by this plugin. 
- * Logically, each Plugin section represents a single Ceph daemon.
- */
 static int ceph_config(oconfig_item_t *ci)
 {
-	int i;
+	int ret, i;
 	struct ceph_daemon *array, *nd, cd;
-	memset(&cd, sizeof(cd), 0);
+	memset(&cd, 0, sizeof(struct ceph_daemon));
+
+	WARNING("entering ceph_config lol!");
 
 	for (i = 0; i < ci->children_num; ++i) {
 		oconfig_item_t *child = ci->children + i;
 		if (strcasecmp("Name", child->key) == 0) {
-			if (snprintf(cd->name, sizeof(cd->name), "%s",
-				     child->value) > (sizeof(cd->name) - 1)) {
-				ERROR("ceph plugin: daemon name '%s' is too long.\n",
-				      child->value);
-				return -ENAMETOOLONG;
-			}
+			ret = cc_handle_str(child, cd.dset.type,
+					    DATA_MAX_NAME_LEN);
+			if (ret)
+				return ret;
 		}
 		else if (strcasecmp("SocketPath", child->key) == 0) {
-			if (snprintf(cd->asok_path, sizeof(cd->asok_path), "%s",
-				     child->value) > (sizeof(cd->asok_path) - 1)) {
-				ERROR("ceph plugin: socket path '%s' is too long.\n",
-				      child->value);
-				return -ENAMETOOLONG;
-			}
+			ret = cc_handle_str(child, cd.asok_path,
+					    sizeof(cd.asok_path));
+			if (ret)
+				return ret;
 		}
 		else {
 			WARNING("ceph plugin: ignoring unknown option %s\n",
 				child->key);
 		}
 	}
-	if (cd.name[0] == '\0') {
+	if (cd.dset.type[0] == '\0') {
 		ERROR("ceph plugin: you must configure a daemon name.\n");
 		return -EINVAL;
 	}
 	else if (cd.asok_path[0] == '\0') {
 		ERROR("ceph plugin(name=%s): you must configure an administrative "
-		      "socket path.\n", cd.name);
+		      "socket path.\n", cd.dset.type);
 		return -EINVAL;
 	}
 	else if (!((cd.asok_path[0] == '/') ||
 	      (cd.asok_path[0] == '.' && cd.asok_path[1] == '/'))) {
 		ERROR("ceph plugin(name=%s): administrative socket paths must begin with "
 		      "'/' or './' Can't parse: '%s'\n",
-		      cd.name, cd.asok_path);
+		      cd.dset.type, cd.asok_path);
 		return -EINVAL;
 	}
-
 	array = realloc(g_daemons,
 			sizeof(struct ceph_daemon *) * (g_num_daemons + 1));
 	if (array == NULL) {
@@ -275,72 +189,143 @@ static int ceph_config(oconfig_item_t *ci)
 		 * runtime error, not a configuration error.  */
 		return ENOMEM;
 	}
-	g_daemons = array;
+	g_daemons = (struct ceph_daemon**)array;
 	nd = malloc(sizeof(struct ceph_daemon));
 	if (!nd)
 		return ENOMEM;
-	memcpy(nd, cd, sizeof(cd));
+	memcpy(nd, &cd, sizeof(struct ceph_daemon));
 	g_daemons[g_num_daemons++] = nd;
 	return 0;
 }
 
-/** Create a nonblocking connection to a unix domain socket with the given path */
-static int asok_connect(const char *path)
-{
-	int fd = socket(PF_UNIX, SOCK_STREAM, 0);
-	if (fd < 0) {
-		int err = errno;
-		ERROR("socket(PF_UNIX, SOCK_STREAM, 0) failed: error %d", err);
-		return -1;
-	}
-	struct sockaddr_un address;
-	memset(&address, 0, sizeof(struct sockaddr_un));
-	address.sun_family = AF_UNIX;
-	snprintf(address.sun_path, sizeof(address.sun_path), "%s", path);
-	if (connect(fd, (struct sockaddr *) &address, 
-			sizeof(struct sockaddr_un)) != 0) {
-		int err = errno;
-		ERROR("connect(%d) failed: error %d", fd, err);
-		return -1;
-	}
+/******* JSON parsing *******/
+typedef int (*node_handler_t)(void*, json_object*, const char*);
 
-	flags = fcntl(fd, F_GETFL, 0);
-	if (fcntl(fd, F_GETFL, flags | O_NONBLOCK) != 0) {
-		ERROR("fcntl(%d, O_NONBLOCK) error", fd, err);
-		return -1;
+/** Perform a depth-first traversal of the JSON parse tree,
+ * calling node_handler at each leaf node.*/
+static int traverse_json_impl(json_object *jo, char *key, int max_key,
+			node_handler_t handler, void *handler_arg)
+{
+	struct json_object_iter iter;
+	int ret, plen, klen;
+
+	plen = strlen(key);
+	json_object_object_foreachC(jo, iter) {
+		klen = strlen(iter.key);
+		if (plen + klen + 2 > max_key)
+			return -ENAMETOOLONG;
+		if (plen != 0)
+			strcat(key, ".");
+		strcat(key, iter.key);
+		switch (json_object_get_type(iter.val)) {
+		case json_type_object:
+			ret = traverse_json_impl(iter.val, key, max_key,
+					    handler, handler_arg);
+			break;
+		case json_type_array:
+			ret = -ENOTSUP;
+			break;
+		default:
+			ret = handler(handler_arg, iter.val, key);
+			break;
+		}
+		if (ret)
+			return ret;
+		key[plen] = '\0';
 	}
-	return fd;
+	return 0;
 }
 
-/** Shut down the Ceph plugin */
-static int ceph_shutdown(void)
+static int traverse_json(const char *json,
+			node_handler_t handler, void *handler_arg)
+{
+	json_object *root;
+	char buf[128];
+	buf[0] = '\0';
+	root = json_tokener_parse(json);
+	if (!root)
+		return -EDOM;
+	return traverse_json_impl(root, buf, sizeof(buf),
+				     handler, handler_arg);
+}
+
+static int node_handler_define_schema(void *arg, json_object *jo,
+				      const char *key)
+{
+	struct ceph_daemon *d = (struct ceph_daemon *)arg;
+
+	switch (json_object_get_type(jo)) {
+	case json_type_boolean:
+	case json_type_double:
+	case json_type_int:
+		return ceph_daemon_add_ds_entry(d, key, DS_TYPE_GAUGE);
+	default:
+		return -ENOTSUP;
+	}
+}
+
+/** A set of values_t data that we build up in memory while parsing the JSON. */
+struct values_tmp {
+	struct ceph_daemon *d;
+	int values_len;
+	value_t values[0];
+};
+
+static value_t* get_matching_value(const struct data_set_s *dset,
+		   const char *name, value_t *values, int num_values)
 {
 	int i;
-	for (i = 0; i < g_num_daemons; ++i) {
-		struct ceph_daemon *d = g_daemons + i;
-		daemon_wipe_io_state(d, CSTATE_DONE);
-		sfree(d);
+	for (i = 0; i < num_values; ++i) {
+		if (strcmp(dset->ds[i].name, name) == 0) {
+			return values + i;
+		}
 	}
-	sfree(g_daemons);
-	g_daemons = NULL;
-	g_num_daemons = 0;
+	return NULL;
 }
 
+static int node_handler_fetch_data(void *arg, json_object *jo,
+				      const char *key)
+{
+	value_t *uv;
+	struct values_tmp *vtmp = (struct values_tmp*)arg;
+
+	switch (json_object_get_type(jo)) {
+	case json_type_boolean:
+	case json_type_double:
+	case json_type_int:
+		uv = get_matching_value(&vtmp->d->dset, key,
+					 vtmp->values, vtmp->values_len);
+		uv->gauge = json_object_get_double(jo);
+		return 0;
+	default:
+		return -ENOTSUP;
+	}
+}
+
+/******* network I/O *******/
 enum cstate_t {
 	CSTATE_UNCONNECTED = 0,
 	CSTATE_WRITE_REQUEST,
 	CSTATE_READ_AMT,
 	CSTATE_READ_JSON,
-	CSTATE_DONE,
 };
 
-/** Represents a connection to a Ceph daemon */
-struct ceph_daemon_conn
-{
-	/** The daemon we're connecting to */
-	struct ceph_daemon *daemon;
+enum request_type_t {
+	ASOK_REQ_NOOP = 0,
+	ASOK_REQ_DATA = 1,
+	ASOK_REQ_SCHEMA = 2,
+	ASOK_REQ_NONE = 1000,
+};
 
-	/** Connection state */
+struct cconn
+{
+	/** The Ceph daemon that we're talking to */
+	struct ceph_daemon *d;
+
+	/** Request type */
+	uint32_t request_type;
+
+	/** The connection state */
 	enum cstate_t state;
 
 	/** The socket we use to talk to this daemon */ 
@@ -354,198 +339,312 @@ struct ceph_daemon_conn
 
 	/** Buffer containing JSON data */
 	char *json;
+};
+
+static int cconn_connect(struct cconn *io)
+{
+	struct sockaddr_un address;
+	int flags, fd, err;
+	if (io->state != CSTATE_UNCONNECTED)
+		return -EDOM;
+	fd = socket(PF_UNIX, SOCK_STREAM, 0);
+	if (fd < 0) {
+		int err = -errno;
+		ERROR("socket(PF_UNIX, SOCK_STREAM, 0) failed: error %d", err);
+		return err;
+	}
+	memset(&address, 0, sizeof(struct sockaddr_un));
+	address.sun_family = AF_UNIX;
+	snprintf(address.sun_path, sizeof(address.sun_path),
+		 "%s", io->d->asok_path);
+	RETRY_ON_EINTR(err, connect(fd, (struct sockaddr *) &address, 
+			sizeof(struct sockaddr_un)));
+	if (err < 0) {
+		ERROR("connect(%d) failed: error %d", fd, err);
+		return err;
+	}
+
+	flags = fcntl(fd, F_GETFL, 0);
+	if (fcntl(fd, F_GETFL, flags | O_NONBLOCK) != 0) {
+		err = -errno;
+		ERROR("fcntl(%d, O_NONBLOCK) error %d", fd, err);
+		return err;
+	}
+	io->asok = fd;
+	io->state = CSTATE_WRITE_REQUEST;
+	return 0;
 }
 
-static void ceph_daemon_conn_reset(struct ceph_daemon_conn *conn)
+static void cconn_close(struct cconn *io)
 {
-	conn->state = state;
-	if (conn->asok != -1) {
+	io->state = CSTATE_UNCONNECTED;
+	if (io->asok != -1) {
 		int res;
-		RETRY_ON_EINTR(res, close(conn->asok));
+		RETRY_ON_EINTR(res, close(io->asok));
 	}
-	conn->asok = -1;
-	conn->amt = 0;
-	conn->json_len = 0;
-	sfree(conn->json);
-	conn->json = NULL;
+	io->asok = -1;
+	io->amt = 0;
+	io->json_len = 0;
+	sfree(io->json);
+	io->json = NULL;
 }
 
-static int ceph_read_setup(struct ceph_daemon *d, struct pollfd* fds)
+/* Process incoming JSON counter data */
+static int cconn_process_data_req(struct cconn *io)
 {
-	switch (d->state) {
-	case CSTATE_UNCONNECTED:
-		d->asok = asok_connect(d->asok_path);
-		if (d->asok == -1) {
-			return 0;
-		}
-		fds->fd = d->asok;
-		fds->events = POLLOUT | POLLWRBAND;
-		fds++;
-		return 1;
-	case CSTATE_WRITE_REQUEST:
-		fds->fd = d->asok;
-		fds->events = POLLOUT | POLLWRBAND;
-		fds++;
-		return 1;
-	case CSTATE_READ_AMT:
-	case CSTATE_READ_JSON:
-		fds->fd = d->asok;
-		fds->events = POLLIN | POLLRDBAND;
-		fds++;
-		return 1;
-	case CSTATE_DONE:
-		// do nothing
-		return 0;
+	int ret;
+	value_list_t vl = VALUE_LIST_INIT;
+	struct values_tmp *vtmp = calloc(1, sizeof(struct values_tmp) +
+				(sizeof(value_t) * io->d->dset.ds_num));
+	if (!vtmp)
+		return -ENOMEM;
+	vtmp->d = io->d;
+	vtmp->values_len = io->d->dset.ds_num;
+	ret = traverse_json(io->json, node_handler_fetch_data, vtmp);
+	if (ret)
+		goto done;
+	sstrncpy(vl.host, hostname_g, sizeof(vl.host));
+	sstrncpy(vl.plugin, "ceph", sizeof(vl.plugin));
+	sstrncpy(vl.type, io->d->dset.type, sizeof(vl.type));
+	vl.values = vtmp->values;
+	vl.values_len = vtmp->values_len;
+	ret = plugin_dispatch_values(&vl);
+done:
+	sfree(vtmp);
+	return ret;
+}
+
+static int cconn_process_json(struct cconn *io)
+{
+	switch (io->request_type) {
+	case ASOK_REQ_DATA:
+		return cconn_process_data_req(io);
+	case ASOK_REQ_SCHEMA:
+		return traverse_json(io->json,
+			     node_handler_define_schema, io->d);
+	default:
+		return -EDOM;
 	}
 }
 
-static int do_ceph_daemon_io(struct ceph_daemon *d, const struct pollfd *pfd,
-			     enum ceph_io_action_t act)
+/** Handle a network event for a connection */
+static int cconn_handle_event(struct cconn *io)
 {
-	switch (d->state) {
+	int ret;
+	switch (io->state) {
 	case CSTATE_UNCONNECTED:
-		/* unreachable */
 		ERROR("do_ceph_daemon_io(name=%s) got to illegal state on line %d",
-		      d->name, __LINE__);
-		return;
+		      io->d->dset.type, __LINE__);
+		return -EDOM;
 	case CSTATE_WRITE_REQUEST: {
-		int res;
-		uint32_t cmd_raw = htonl(0x1);
-		RETRY_ON_EINTR(res, write(d->asok, ((char*)cmd) + d->amt,
-					       sizeof(cmd_raw) - d->amt));
-		if (res == -1)
-			return errno;
-		d->amt += res;
-		if (d->amt >= sizeof(cmd_raw)) {
-			d->amt = 0;
-			d->state = CSTATE_READ_AMT;
+		uint32_t cmd = htonl(0x1);
+		RETRY_ON_EINTR(ret, write(io->asok, ((char*)&cmd) + io->amt,
+					       sizeof(cmd) - io->amt));
+		if (ret < 0)
+			return ret;
+		io->amt += ret;
+		if (io->amt >= sizeof(cmd)) {
+			io->amt = 0;
+			io->state = CSTATE_READ_AMT;
 		}
 		return 0;
 	}
 	case CSTATE_READ_AMT: {
-		int res;
-		RETRY_ON_EINTR(res, read(d->asok, ((char*)d->json_len) + d->amt,
-					       sizeof(d->json_len) - d->amt));
-		if (res == -1)
-			return errno;
-		d->amt += res;
-		if (d->amt >= sizeof(cmd_raw)) {
-			d->json_len = ntohl(d->json_len);
-			d->amt = 0;
-			d->state = CSTATE_READ_JSON;
-			d->json = malloc(d->json_len);
-			if (!d->json)
-				return -ENOBUFS;
+		RETRY_ON_EINTR(ret, read(io->asok, 
+			((char*)(&io->json_len)) + io->amt,
+			sizeof(io->json_len) - io->amt));
+		if (ret < 0)
+			return ret;
+		io->amt += ret;
+		if (io->amt >= sizeof(io->json_len)) {
+			io->json_len = ntohl(io->json_len);
+			io->amt = 0;
+			io->state = CSTATE_READ_JSON;
+			io->json = calloc(1, io->json_len + 1);
+			if (!io->json)
+				return -ENOMEM;
 		}
 		return 0;
 	}
 	case CSTATE_READ_JSON: {
-		int res;
-		RETRY_ON_EINTR(res, read(d->asok, d->json + d->amt,
-					      d->json_len - d->amt));
-		if (res == -1)
-			return errno;
-		d->amt += res;
-		if (d->amt >= d->json_len) {
-			int ret = process_json(d, act);
+		RETRY_ON_EINTR(ret, read(io->asok, io->json + io->amt,
+					      io->json_len - io->amt));
+		if (ret < 0)
+			return ret;
+		io->amt += ret;
+		if (io->amt >= io->json_len) {
+			ret = cconn_process_json(io);
 			if (ret)
 				return ret;
-			daemon_wipe_io_state(d, CSTATE_DONE);
+			cconn_close(io);
+			io->request_type = ASOK_REQ_NONE;
 		}
 		return 0;
 	}
-	case CSTATE_DONE:
-		// do nothing
-		return 0;
+	default:
+		ERROR("cconn_handle_event(name=%s) got to illegal state on "
+		      "line %d", io->d->dset.type, __LINE__);
+		return -EDOM;
 	}
+}
+
+static int cconn_prepare(struct cconn *io, struct pollfd* fds)
+{
+	int ret;
+	if (io->request_type == ASOK_REQ_NONE)
+		return 0;
+	switch (io->state) {
+	case CSTATE_UNCONNECTED:
+		ret = cconn_connect(io);
+		if (ret > 0)
+			return -ret;
+		else if (ret < 0)
+			return ret;
+		fds->fd = io->asok;
+		fds->events = POLLOUT;
+		return 1;
+	case CSTATE_WRITE_REQUEST:
+		fds->fd = io->asok;
+		fds->events = POLLOUT;
+		return 1;
+	case CSTATE_READ_AMT:
+	case CSTATE_READ_JSON:
+		fds->fd = io->asok;
+		fds->events = POLLIN;
+		return 1;
+	default:
+		ERROR("cconn_prepare(name=%s) got to illegal state on line %d",
+		      io->d->dset.type, __LINE__);
+		return -EDOM;
+	}
+}
+
+/** Returns the difference between two struct timevals in milliseconds.
+ * On overflow, we return max/min int.
+ */
+static int milli_diff(const struct timeval *t1, const struct timeval *t2)
+{
+	int64_t ret;
+	int sec_diff = t1->tv_sec - t2->tv_sec;
+	int usec_diff = t1->tv_usec - t2->tv_usec;
+	ret = usec_diff / 1000;
+	ret += (sec_diff * 1000);
+	if (ret > INT_MAX)
+		return INT_MAX;
+	else if (ret < INT_MIN)
+		return INT_MIN;
+	return (int)ret;
 }
 
 /** This handles the actual network I/O to talk to the Ceph daemons.
- *
- * This is called from ceph_init with CIO_ACTION_DEFINE_SCHEMA to figure out
- * what data the daemons are reporting.  This is also called from ceph_read
- * with CIO_ACTION_REPORT_DATA to report the data.
  */
-static int do_ceph_io(enum ceph_io_action_t act)
+static int cconn_main_loop(uint32_t request_type)
 {
-	int i, num_read = 0;
+	int i, ret;
+	struct timeval end_tv;
+	struct cconn io_array[g_num_daemons];
+
+	/* create cconn array */
+	memset(io_array, 0, sizeof(io_array));
+	for (i = 0; i < g_num_daemons; ++i) {
+		io_array[i].d = g_daemons[i];
+		io_array[i].request_type = request_type;
+		io_array[i].state = CSTATE_UNCONNECTED;
+	}
 
 	/** Calculate the time at which we should give up */
-	struct timeval end_tv;
 	gettimeofday(&end_tv, NULL);
 	end_tv.tv_sec += CEPH_TIMEOUT_INTERVAL;
 
-	while (true) {
-		struct pollfd fds[g_num_daemons];
-		struct ceph_daemon *pdaemons[g_num_daemons];
+	while (1) {
 		int nfds, diff;
 		struct timeval tv;
-
+		struct cconn *polled_io_array[g_num_daemons];
+		struct pollfd fds[g_num_daemons];
 		memset(fds, 0, sizeof(fds));
 		nfds = 0;
 		for (i = 0; i < g_num_daemons; ++i) {
-			if (ceph_read_setup(g_daemons + i, fds + nfds)) {
-				pdaemons[nfds++] = g_daemons + i;
+			struct cconn *io = io_array + i;
+			ret = cconn_prepare(io, fds + nfds);
+			if (ret < 0) {
+				cconn_close(io);
+				io->request_type = ASOK_REQ_NONE;
+			}
+			else if (ret == 1) {
+				polled_io_array[nfds++] = io_array + i;
 			}
 		}
 		if (nfds == 0) {
-			/* Success */
-			return 0;
+			/* finished */
+			ret = 0;
+			goto done;
 		}
 		gettimeofday(&tv, NULL);
-		diff = milli_diff(end_tv, tv);
+		diff = milli_diff(&end_tv, &tv);
 		if (diff <= 0) {
 			/* Timed out */
-			return -ETIMEOUT;
+			ret = -ETIMEDOUT;
+			goto done;
 		}
-		int ret = poll(fds, nfds, diff);
+		RETRY_ON_EINTR(ret, poll(fds, nfds, diff));
 		if (ret < 0) {
-			int err = errno;
-			if (err == EINTR)
-				continue;
-			ERROR("poll(2) error: %d", err);
-			return err;
+			ERROR("poll(2) error: %d", ret);
+			goto done;
 		}
 		for (i = 0; i < nfds; ++i) {
-			int ret = do_ceph_daemon_io(pdaemons + i, fds + i, act);
-			if (ret) {
-				ERROR("do_ceph_daemon_io(name=%s) got error %d",
-				      pdaemons[i].name, ret);
-				daemon_wipe_io_state(pdaemons + i,
-						     CSTATE_UNCONNECTED);
+			struct cconn *io = polled_io_array[i];
+			int f = fds[i].revents;
+			if ((f & POLLERR) || (f & POLLHUP)) {
+				cconn_close(io);
+				io->request_type = ASOK_REQ_NONE;
+			}
+			else if ((f & POLLIN) || (f & POLLOUT)) {
+				int ret = cconn_handle_event(io);
+				if (ret) {
+					cconn_close(io);
+					io->request_type = ASOK_REQ_NONE;
+				}
 			}
 		}
 	}
+done:
+	for (i = 0; i < g_num_daemons; ++i) {
+		cconn_close(io_array + i);
+	}
+	return ret;
 }
 
-/** Read data from the Ceph daemons */
 static int ceph_read(void)
 {
-	/* reset all I/O state */
-	for (i = 0; i < g_num_daemons; ++i) {
-		struct ceph_daemon *d = g_daemons + i;
-		if (d->data_set_len == 0)
-			daemon_wipe_io_state(g_daemons + i, CSTATE_DONE);
-		else
-			daemon_wipe_io_state(g_daemons + i, CSTATE_UNCONNECTED);
-	}
-	return do_ceph_io(CIO_ACTION_REPORT_DATA);
+	return cconn_main_loop(ASOK_REQ_DATA);
 }
 
-static int ceph_read_schema(void)
+/******* lifecycle *******/
+static int ceph_init(void)
 {
-	/* reset all I/O state */
+	WARNING("ceph_init");
+	ceph_daemons_print();
+
+	return cconn_main_loop(ASOK_REQ_SCHEMA);
+}
+
+static int ceph_shutdown(void)
+{
+	int i;
 	for (i = 0; i < g_num_daemons; ++i) {
-		struct ceph_daemon *d = g_daemons + i;
-		daemon_wipe_io_state(g_daemons + i, CSTATE_UNCONNECTED);
+		ceph_daemon_free(g_daemons[i]);
 	}
-	return do_ceph_io(CIO_ACTION_DEFINE_SCHEMA);
+	sfree(g_daemons);
+	g_daemons = NULL;
+	g_num_daemons = 0;
+	WARNING("finished ceph_shutdown");
+	return 0;
 }
 
 void module_register(void)
 {
 	plugin_register_complex_config("ceph", ceph_config);
-	plugin_register_shutdown("ceph", ceph_shutdown);
-	plugin_register_data_set(&g_data_set);
+	plugin_register_init("ceph", ceph_init);
 	plugin_register_read("ceph", ceph_read);
+	plugin_register_shutdown("ceph", ceph_shutdown);
 }

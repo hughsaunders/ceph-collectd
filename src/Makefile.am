@@ -988,7 +988,7 @@ endif
 
 #if BUILD_PLUGIN_CEPH
 pkglib_LTLIBRARIES += ceph.la
-ceph_la_SOURCES = simple.c
+ceph_la_SOURCES = ceph.c
 #ceph.c
 ceph_la_LDFLAGS = -module -avoid-version
 ceph_la_CFLAGS = $(AM_CFLAGS)
