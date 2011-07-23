@@ -3947,6 +3947,9 @@ with_libxml2_ldflags=""
 with_libvirt="no (pkg-config isn't available)"
 with_libvirt_cflags=""
 with_libvirt_ldflags=""
+with_libjsonc="no (pkg-config isn't available)"
+with_libjsonc_cflags=""
+with_libjsonc_ldflags=""
 if test "x$PKG_CONFIG" != "x"
 then
 	pkg-config --exists 'libxml-2.0' 2>/dev/null
@@ -3964,6 +3967,15 @@ then
 	else
 		with_libvirt="no (pkg-config doesn't know libvirt)"
 	fi
+
+	pkg-config --exists 'libjson-c' 2>/dev/null
+	if test "$?" = "0"
+	then
+		with_libjsonc="yes"
+	else
+		with_libjsonc="no (pkg-config doesn't know libjson-c)"
+	fi
+
 fi
 if test "x$with_libxml2" = "xyes"
 then
@@ -4009,6 +4021,19 @@ if test "x$with_libxml2" = "xyes"; then
 	BUILD_WITH_LIBXML2_LIBS="$with_libxml2_ldflags"
 	AC_SUBST(BUILD_WITH_LIBXML2_CFLAGS)
 	AC_SUBST(BUILD_WITH_LIBXML2_LIBS)
+fi
+if test "x$with_libjsonc" = "xyes"
+then
+	with_libjsonc_cflags="`pkg-config --cflags libjsonc`"
+	if test $? -ne 0
+	then
+		with_libjsonc="no"
+	fi
+	with_libjsonc_ldflags="`pkg-config --libs libjsonc`"
+	if test $? -ne 0
+	then
+		with_libjsonc="no"
+	fi
 fi
 if test "x$with_libvirt" = "xyes"
 then
@@ -4275,7 +4300,7 @@ dependency_error="no"
 plugin_ascent="no"
 plugin_battery="no"
 plugin_bind="no"
-with_ceph="no"
+plugin_ceph="no"
 plugin_conntrack="no"
 plugin_contextswitch="no"
 plugin_cpu="no"
@@ -4398,6 +4423,11 @@ then
 	plugin_memory="yes"
 	plugin_swap="yes"
 	plugin_users="yes"
+fi
+
+if test "x$with_libjsonc" = "xyes"
+then
+	plugin_ceph="yes"
 fi
 
 if test "x$with_libcurl" = "xyes" && test "x$with_libxml2" = "xyes"
@@ -4575,7 +4605,7 @@ AC_PLUGIN([apple_sensors], [$with_libiokit],   [Apple's hardware sensors])
 AC_PLUGIN([ascent],      [$plugin_ascent],     [AscentEmu player statistics])
 AC_PLUGIN([battery],     [$plugin_battery],    [Battery statistics])
 AC_PLUGIN([bind],        [$plugin_bind],       [ISC Bind nameserver statistics])
-AC_PLUGIN([ceph],        [$with_ceph],         [Ceph Distributed Filesystem monitoring plugin])
+AC_PLUGIN([ceph],        [$plugin_ceph],         [Ceph Distributed Filesystem monitoring plugin])
 AC_PLUGIN([conntrack],   [$plugin_conntrack],  [nf_conntrack statistics])
 AC_PLUGIN([contextswitch], [$plugin_contextswitch], [context switch statistics])
 AC_PLUGIN([cpufreq],     [$plugin_cpufreq],    [CPU frequency statistics])
@@ -4882,6 +4912,7 @@ Configuration:
     protobuf-c  . . . . . $have_protoc_c
     oracle  . . . . . . . $with_oracle
     python  . . . . . . . $with_python
+    libjson-c . . . . . . $with_libjsonc
 
   Features:
     daemon mode . . . . . $enable_daemon
