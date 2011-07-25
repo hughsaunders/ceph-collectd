@@ -59,9 +59,6 @@
 /** Maximum path length for a UNIX domain socket on this system */
 #define UNIX_DOMAIN_SOCK_PATH_MAX (sizeof(((struct sockaddr_un*)0)->sun_path))
 
-#undef DEBUG
-#define DEBUG WARNING
-
 /******* ceph_daemon *******/
 struct ceph_daemon
 {
@@ -397,7 +394,7 @@ static void cconn_close(struct cconn *io)
 }
 
 /* Process incoming JSON counter data */
-static int cconn_process_data_req(struct cconn *io)
+static int cconn_process_data(struct cconn *io)
 {
 	int ret;
 	value_list_t vl = VALUE_LIST_INIT;
@@ -415,8 +412,8 @@ static int cconn_process_data_req(struct cconn *io)
 	sstrncpy(vl.type, io->d->dset.type, sizeof(vl.type));
 	vl.values = vtmp->values;
 	vl.values_len = vtmp->values_len;
-	DEBUG("cconn_process_data_req(io=%s): vl.values_len=%d",
-	      io->d->dset.type, vl.values_len);
+	DEBUG("cconn_process_data(io=%s): vl.values_len=%d, json=\"%s\"",
+	      io->d->dset.type, vl.values_len, io->json);
 	ret = plugin_dispatch_values(&vl);
 done:
 	sfree(vtmp);
@@ -427,7 +424,7 @@ static int cconn_process_json(struct cconn *io)
 {
 	switch (io->request_type) {
 	case ASOK_REQ_DATA:
-		return cconn_process_data_req(io);
+		return cconn_process_data(io);
 	case ASOK_REQ_SCHEMA:
 		return traverse_json(io->json,
 			     node_handler_define_schema, io->d);
@@ -527,8 +524,17 @@ static int cconn_handle_event(struct cconn *io)
 static int cconn_prepare(struct cconn *io, struct pollfd* fds)
 {
 	int ret;
-	if (io->request_type == ASOK_REQ_NONE)
+	if (io->request_type == ASOK_REQ_NONE) {
+		/* The request has already been serviced. */
 		return 0;
+	}
+	else if ((io->request_type == ASOK_REQ_DATA) &&
+			 (io->d->dset.ds_num == 0)) {
+		/* If there are no counters to report on, don't bother
+		 * connecting */
+		return 0;
+	}
+
 	switch (io->state) {
 	case CSTATE_UNCONNECTED:
 		ret = cconn_connect(io);
@@ -605,7 +611,7 @@ static int cconn_main_loop(uint32_t request_type)
 			struct cconn *io = io_array + i;
 			ret = cconn_prepare(io, fds + nfds);
 			if (ret < 0) {
-				WARNING("cconn_prepare(name=%s,i=%d,st=%d)=%d",
+				WARNING("ERROR: cconn_prepare(name=%s,i=%d,st=%d)=%d",
 				      io->d->dset.type, i, io->state, ret);
 				cconn_close(io);
 				io->request_type = ASOK_REQ_NONE;
@@ -628,7 +634,7 @@ static int cconn_main_loop(uint32_t request_type)
 		if (diff <= 0) {
 			/* Timed out */
 			ret = -ETIMEDOUT;
-			WARNING("cconn_main_loop: timed out.\n");
+			WARNING("ERROR: cconn_main_loop: timed out.\n");
 			goto done;
 		}
 		RETRY_ON_EINTR(ret, poll(fds, nfds, diff));
@@ -639,8 +645,12 @@ static int cconn_main_loop(uint32_t request_type)
 		for (i = 0; i < nfds; ++i) {
 			struct cconn *io = polled_io_array[i];
 			int revents = fds[i].revents;
-			if (cconn_validate_revents(io, revents)) {
-				WARNING("cconn(name=%s,i=%d,st=%d): error: "
+			if (revents == 0) {
+				/* do nothing */
+			}
+			else if (cconn_validate_revents(io, revents)) {
+				WARNING("ERROR: cconn(name=%s,i=%d,st=%d): "
+					"revents validation error: "
 					"revents=0x%08x", io->d->dset.type, i,
 					io->state, revents);
 				cconn_close(io);
@@ -650,7 +660,7 @@ static int cconn_main_loop(uint32_t request_type)
 			else {
 				int ret = cconn_handle_event(io);
 				if (ret) {
-					WARNING("cconn_handle_event(name=%s,"
+					WARNING("ERROR: cconn_handle_event(name=%s,"
 						"i=%d,st=%d): error %d",
 						io->d->dset.type, i,
 						io->state, ret);
@@ -683,7 +693,7 @@ static int ceph_read(void)
 static int ceph_init(void)
 {
 	int i, ret;
-	WARNING("ceph_init");
+	DEBUG("ceph_init");
 	ceph_daemons_print();
 
 	ret = cconn_main_loop(ASOK_REQ_SCHEMA);
@@ -714,7 +724,7 @@ static int ceph_shutdown(void)
 	sfree(g_daemons);
 	g_daemons = NULL;
 	g_num_daemons = 0;
-	WARNING("finished ceph_shutdown");
+	DEBUG("finished ceph_shutdown");
 	return 0;
 }
 
