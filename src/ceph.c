@@ -45,14 +45,12 @@
 
 #define RETRY_ON_EINTR(ret, expr) \
 	while(1) { \
-		if (expr < 0) { \
-			if (errno == EINTR) \
-				continue; \
-			ret = -errno; \
+		ret = expr; \
+		if (ret >= 0) \
 			break; \
-		} \
-		ret = 0; \
-		break; \
+		ret = -errno; \
+		if (ret != -EINTR) \
+			break; \
 	}
 
 /** Timeout interval in seconds */
@@ -60,6 +58,9 @@
 
 /** Maximum path length for a UNIX domain socket on this system */
 #define UNIX_DOMAIN_SOCK_PATH_MAX (sizeof(((struct sockaddr_un*)0)->sun_path))
+
+#undef DEBUG
+#define DEBUG WARNING
 
 /******* ceph_daemon *******/
 struct ceph_daemon
@@ -83,7 +84,7 @@ static int g_num_daemons = 0;
 
 static void ceph_daemon_print(const struct ceph_daemon *d)
 {
-	WARNING("name=%s, asok_path=%s", d->dset.type, d->asok_path);
+	DEBUG("name=%s, asok_path=%s", d->dset.type, d->asok_path);
 }
 
 static void ceph_daemons_print(void)
@@ -145,8 +146,6 @@ static int ceph_config(oconfig_item_t *ci)
 	struct ceph_daemon *array, *nd, cd;
 	memset(&cd, 0, sizeof(struct ceph_daemon));
 
-	WARNING("entering ceph_config lol!");
-
 	for (i = 0; i < ci->children_num; ++i) {
 		oconfig_item_t *child = ci->children + i;
 		if (strcasecmp("Name", child->key) == 0) {
@@ -162,7 +161,7 @@ static int ceph_config(oconfig_item_t *ci)
 				return ret;
 		}
 		else {
-			WARNING("ceph plugin: ignoring unknown option %s\n",
+			WARNING("ceph plugin: ignoring unknown option %s",
 				child->key);
 		}
 	}
@@ -258,6 +257,8 @@ static int node_handler_define_schema(void *arg, json_object *jo,
 	case json_type_boolean:
 	case json_type_double:
 	case json_type_int:
+		DEBUG("ceph_daemon_add_ds_entry(d=%s,key=%s)",
+		      d->dset.type, key);
 		return ceph_daemon_add_ds_entry(d, key, DS_TYPE_GAUGE);
 	default:
 		return -ENOTSUP;
@@ -345,12 +346,15 @@ static int cconn_connect(struct cconn *io)
 {
 	struct sockaddr_un address;
 	int flags, fd, err;
-	if (io->state != CSTATE_UNCONNECTED)
+	if (io->state != CSTATE_UNCONNECTED) {
+		ERROR("cconn_connect: io->state != CSTATE_UNCONNECTED");
 		return -EDOM;
+	}
 	fd = socket(PF_UNIX, SOCK_STREAM, 0);
 	if (fd < 0) {
 		int err = -errno;
-		ERROR("socket(PF_UNIX, SOCK_STREAM, 0) failed: error %d", err);
+		ERROR("cconn_connect: socket(PF_UNIX, SOCK_STREAM, 0) failed: "
+		      "error %d", err);
 		return err;
 	}
 	memset(&address, 0, sizeof(struct sockaddr_un));
@@ -360,18 +364,21 @@ static int cconn_connect(struct cconn *io)
 	RETRY_ON_EINTR(err, connect(fd, (struct sockaddr *) &address, 
 			sizeof(struct sockaddr_un)));
 	if (err < 0) {
-		ERROR("connect(%d) failed: error %d", fd, err);
+		ERROR("cconn_connect: connect(%d) failed: error %d", fd, err);
 		return err;
 	}
 
 	flags = fcntl(fd, F_GETFL, 0);
-	if (fcntl(fd, F_GETFL, flags | O_NONBLOCK) != 0) {
+	if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
 		err = -errno;
-		ERROR("fcntl(%d, O_NONBLOCK) error %d", fd, err);
+		ERROR("cconn_connect: fcntl(%d, O_NONBLOCK) error %d", fd, err);
 		return err;
 	}
 	io->asok = fd;
 	io->state = CSTATE_WRITE_REQUEST;
+	io->amt = 0;
+	io->json_len = 0;
+	io->json = NULL;
 	return 0;
 }
 
@@ -427,19 +434,42 @@ static int cconn_process_json(struct cconn *io)
 	}
 }
 
+static int cconn_validate_revents(struct cconn *io, int revents)
+{
+	if (revents & POLLERR) {
+		ERROR("cconn_validate_revents(name=%s): got POLLERR",
+		      io->d->dset.type);
+		return -EIO;
+	}
+	switch (io->state) {
+	case CSTATE_WRITE_REQUEST:
+		return (revents & POLLOUT) ? 0 : -EINVAL;
+	case CSTATE_READ_AMT:
+		return (revents & POLLIN) ? 0 : -EINVAL;
+	case CSTATE_READ_JSON:
+		return (revents & POLLIN) ? 0 : -EINVAL;
+	default:
+		ERROR("cconn_validate_revents(name=%s) got to illegal state on line %d",
+		      io->d->dset.type, __LINE__);
+		return -EDOM;
+	}
+}
+
 /** Handle a network event for a connection */
 static int cconn_handle_event(struct cconn *io)
 {
 	int ret;
 	switch (io->state) {
 	case CSTATE_UNCONNECTED:
-		ERROR("do_ceph_daemon_io(name=%s) got to illegal state on line %d",
+		ERROR("cconn_handle_event(name=%s) got to illegal state on line %d",
 		      io->d->dset.type, __LINE__);
 		return -EDOM;
 	case CSTATE_WRITE_REQUEST: {
 		uint32_t cmd = htonl(0x1);
 		RETRY_ON_EINTR(ret, write(io->asok, ((char*)&cmd) + io->amt,
 					       sizeof(cmd) - io->amt));
+		DEBUG("cconn_handle_event(name=%s,state=%d,amt=%d,ret=%d)",
+		      io->d->dset.type, io->state, io->amt, ret);
 		if (ret < 0)
 			return ret;
 		io->amt += ret;
@@ -453,6 +483,8 @@ static int cconn_handle_event(struct cconn *io)
 		RETRY_ON_EINTR(ret, read(io->asok, 
 			((char*)(&io->json_len)) + io->amt,
 			sizeof(io->json_len) - io->amt));
+		DEBUG("cconn_handle_event(name=%s,state=%d,ret=%d)",
+		      io->d->dset.type, io->state, ret);
 		if (ret < 0)
 			return ret;
 		io->amt += ret;
@@ -469,6 +501,8 @@ static int cconn_handle_event(struct cconn *io)
 	case CSTATE_READ_JSON: {
 		RETRY_ON_EINTR(ret, read(io->asok, io->json + io->amt,
 					      io->json_len - io->amt));
+		DEBUG("cconn_handle_event(name=%s,state=%d,ret=%d)",
+		      io->d->dset.type, io->state, ret);
 		if (ret < 0)
 			return ret;
 		io->amt += ret;
@@ -540,9 +574,11 @@ static int milli_diff(const struct timeval *t1, const struct timeval *t2)
  */
 static int cconn_main_loop(uint32_t request_type)
 {
-	int i, ret;
+	int i, ret, some_unreachable = 0;
 	struct timeval end_tv;
 	struct cconn io_array[g_num_daemons];
+
+	DEBUG("entering cconn_main_loop(request_type = %d)", request_type);
 
 	/* create cconn array */
 	memset(io_array, 0, sizeof(io_array));
@@ -567,16 +603,22 @@ static int cconn_main_loop(uint32_t request_type)
 			struct cconn *io = io_array + i;
 			ret = cconn_prepare(io, fds + nfds);
 			if (ret < 0) {
+				WARNING("cconn_prepare(name=%s,i=%d,st=%d)=%d",
+				      io->d->dset.type, i, io->state, ret);
 				cconn_close(io);
 				io->request_type = ASOK_REQ_NONE;
+				some_unreachable = 1;
 			}
 			else if (ret == 1) {
+				DEBUG("did cconn_prepare(name=%s,i=%d,st=%d)",
+				      io->d->dset.type, i, io->state);
 				polled_io_array[nfds++] = io_array + i;
 			}
 		}
 		if (nfds == 0) {
 			/* finished */
 			ret = 0;
+			DEBUG("cconn_main_loop: no more cconn to manage.");
 			goto done;
 		}
 		gettimeofday(&tv, NULL);
@@ -584,6 +626,7 @@ static int cconn_main_loop(uint32_t request_type)
 		if (diff <= 0) {
 			/* Timed out */
 			ret = -ETIMEDOUT;
+			WARNING("cconn_main_loop: timed out.\n");
 			goto done;
 		}
 		RETRY_ON_EINTR(ret, poll(fds, nfds, diff));
@@ -593,16 +636,25 @@ static int cconn_main_loop(uint32_t request_type)
 		}
 		for (i = 0; i < nfds; ++i) {
 			struct cconn *io = polled_io_array[i];
-			int f = fds[i].revents;
-			if ((f & POLLERR) || (f & POLLHUP)) {
+			int revents = fds[i].revents;
+			if (cconn_validate_revents(io, revents)) {
+				WARNING("cconn(name=%s,i=%d,st=%d): error: "
+					"revents=0x%08x", io->d->dset.type, i,
+					io->state, revents);
 				cconn_close(io);
 				io->request_type = ASOK_REQ_NONE;
+				some_unreachable = 1;
 			}
-			else if ((f & POLLIN) || (f & POLLOUT)) {
+			else {
 				int ret = cconn_handle_event(io);
 				if (ret) {
+					WARNING("cconn_handle_event(name=%s,"
+						"i=%d,st=%d): error %d",
+						io->d->dset.type, i,
+						io->state, ret);
 					cconn_close(io);
 					io->request_type = ASOK_REQ_NONE;
+					some_unreachable = 1;
 				}
 			}
 		}
@@ -610,6 +662,12 @@ static int cconn_main_loop(uint32_t request_type)
 done:
 	for (i = 0; i < g_num_daemons; ++i) {
 		cconn_close(io_array + i);
+	}
+	if (some_unreachable) {
+		DEBUG("cconn_main_loop: some Ceph daemons were unreachable.");
+	}
+	else {
+		DEBUG("cconn_main_loop: reached all Ceph daemons :)");
 	}
 	return ret;
 }
@@ -622,10 +680,25 @@ static int ceph_read(void)
 /******* lifecycle *******/
 static int ceph_init(void)
 {
+	int i, ret;
 	WARNING("ceph_init");
 	ceph_daemons_print();
 
-	return cconn_main_loop(ASOK_REQ_SCHEMA);
+	ret = cconn_main_loop(ASOK_REQ_SCHEMA);
+	if (ret)
+		return ret;
+	for (i = 0; i < g_num_daemons; ++i) {
+		ret = plugin_register_data_set(&g_daemons[i]->dset);
+		if (ret) {
+			ERROR("plugin_register_data_set(%s) failed!",
+			      g_daemons[i]->dset.type);
+		}
+		else {
+			DEBUG("plugin_register_data_set(%s)",
+			      g_daemons[i]->dset.type);
+		}
+	}
+	return 0;
 }
 
 static int ceph_shutdown(void)
