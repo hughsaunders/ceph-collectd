@@ -62,6 +62,9 @@
 /******* ceph_daemon *******/
 struct ceph_daemon
 {
+	/** Version of the admin_socket interface */
+	uint32_t version;
+
 	/** Path to the socket that we use to talk to the ceph daemon */
 	char asok_path[UNIX_DOMAIN_SOCK_PATH_MAX];
 
@@ -304,12 +307,13 @@ static int node_handler_fetch_data(void *arg, json_object *jo,
 enum cstate_t {
 	CSTATE_UNCONNECTED = 0,
 	CSTATE_WRITE_REQUEST,
+	CSTATE_READ_VERSION,
 	CSTATE_READ_AMT,
 	CSTATE_READ_JSON,
 };
 
 enum request_type_t {
-	ASOK_REQ_NOOP = 0,
+	ASOK_REQ_VERSION = 0,
 	ASOK_REQ_DATA = 1,
 	ASOK_REQ_SCHEMA = 2,
 	ASOK_REQ_NONE = 1000,
@@ -443,9 +447,10 @@ static int cconn_validate_revents(struct cconn *io, int revents)
 	switch (io->state) {
 	case CSTATE_WRITE_REQUEST:
 		return (revents & POLLOUT) ? 0 : -EINVAL;
+	case CSTATE_READ_VERSION:
 	case CSTATE_READ_AMT:
-		return (revents & POLLIN) ? 0 : -EINVAL;
 	case CSTATE_READ_JSON:
+		return (revents & POLLIN) ? 0 : -EINVAL;
 		return (revents & POLLIN) ? 0 : -EINVAL;
 	default:
 		ERROR("cconn_validate_revents(name=%s) got to illegal state on line %d",
@@ -464,7 +469,7 @@ static int cconn_handle_event(struct cconn *io)
 		      io->d->dset.type, __LINE__);
 		return -EDOM;
 	case CSTATE_WRITE_REQUEST: {
-		uint32_t cmd = htonl(0x1);
+		uint32_t cmd = htonl(io->request_type);
 		RETRY_ON_EINTR(ret, write(io->asok, ((char*)&cmd) + io->amt,
 					       sizeof(cmd) - io->amt));
 		DEBUG("cconn_handle_event(name=%s,state=%d,amt=%d,ret=%d)",
@@ -474,7 +479,39 @@ static int cconn_handle_event(struct cconn *io)
 		io->amt += ret;
 		if (io->amt >= sizeof(cmd)) {
 			io->amt = 0;
-			io->state = CSTATE_READ_AMT;
+			switch (io->request_type) {
+			case ASOK_REQ_VERSION:
+				io->state = CSTATE_READ_VERSION;
+				break;
+			default:
+				io->state = CSTATE_READ_AMT;
+				break;
+			}
+		}
+		return 0;
+	}
+	case CSTATE_READ_VERSION: {
+		RETRY_ON_EINTR(ret, read(io->asok, 
+			((char*)(&io->d->version)) + io->amt,
+			sizeof(io->d->version) - io->amt));
+		DEBUG("cconn_handle_event(name=%s,state=%d,ret=%d)",
+		      io->d->dset.type, io->state, ret);
+		if (ret < 0)
+			return ret;
+		io->amt += ret;
+		if (io->amt >= sizeof(io->d->version)) {
+			io->d->version = ntohl(io->d->version);
+			if (io->d->version != 1) {
+				ERROR("cconn_handle_event(name=%s) not "
+				      "expecting version %d!", 
+				      io->d->dset.type, io->d->version);
+				return -ENOTSUP;
+			}
+			DEBUG("cconn_handle_event(name=%s): identified as "
+			      "version %d", io->d->dset.type, io->d->version);
+			io->amt = 0;
+			cconn_close(io);
+			io->request_type = ASOK_REQ_SCHEMA;
 		}
 		return 0;
 	}
@@ -549,6 +586,7 @@ static int cconn_prepare(struct cconn *io, struct pollfd* fds)
 		fds->fd = io->asok;
 		fds->events = POLLOUT;
 		return 1;
+	case CSTATE_READ_VERSION:
 	case CSTATE_READ_AMT:
 	case CSTATE_READ_JSON:
 		fds->fd = io->asok;
@@ -696,7 +734,7 @@ static int ceph_init(void)
 	DEBUG("ceph_init");
 	ceph_daemons_print();
 
-	ret = cconn_main_loop(ASOK_REQ_SCHEMA);
+	ret = cconn_main_loop(ASOK_REQ_VERSION);
 	if (ret)
 		return ret;
 	for (i = 0; i < g_num_daemons; ++i) {
