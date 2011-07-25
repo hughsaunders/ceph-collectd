@@ -214,8 +214,8 @@ static int traverse_json_impl(json_object *jo, char *key, int max_key,
 		if (plen + klen + 2 > max_key)
 			return -ENAMETOOLONG;
 		if (plen != 0)
-			strcat(key, ".");
-		strcat(key, iter.key);
+			strncat(key, ".", max_key); /* really should be strcat */
+		strncat(key, iter.key, max_key);
 		switch (json_object_get_type(iter.val)) {
 		case json_type_object:
 			ret = traverse_json_impl(iter.val, key, max_key,
@@ -415,6 +415,8 @@ static int cconn_process_data_req(struct cconn *io)
 	sstrncpy(vl.type, io->d->dset.type, sizeof(vl.type));
 	vl.values = vtmp->values;
 	vl.values_len = vtmp->values_len;
+	DEBUG("cconn_process_data_req(io=%s): vl.values_len=%d",
+	      io->d->dset.type, vl.values_len);
 	ret = plugin_dispatch_values(&vl);
 done:
 	sfree(vtmp);
@@ -688,14 +690,16 @@ static int ceph_init(void)
 	if (ret)
 		return ret;
 	for (i = 0; i < g_num_daemons; ++i) {
-		ret = plugin_register_data_set(&g_daemons[i]->dset);
+		struct ceph_daemon *d = g_daemons[i];
+		ret = plugin_register_data_set(&d->dset);
 		if (ret) {
 			ERROR("plugin_register_data_set(%s) failed!",
-			      g_daemons[i]->dset.type);
+			      d->dset.type);
 		}
 		else {
-			DEBUG("plugin_register_data_set(%s)",
-			      g_daemons[i]->dset.type);
+			DEBUG("plugin_register_data_set(%s): "
+			      "d->dset.ds_num=%d",
+			      d->dset.type, d->dset.ds_num);
 		}
 	}
 	return 0;
