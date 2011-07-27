@@ -3096,6 +3096,11 @@ fi
 
 if test "x$with_python" = "xyes"
 then
+	AM_PATH_PYTHON([2.6], [], [AC_MSG_FAILURE([Failed to find Python 2.7 or newer])])
+fi
+
+if test "x$with_python" = "xyes"
+then
 	CPPFLAGS="-I$python_include_path $CPPFLAGS"
 	AC_CHECK_HEADERS(Python.h,
 			 [with_python="yes"],
@@ -4840,7 +4845,7 @@ AC_SUBST(LCC_VERSION_STRING)
 
 AC_CONFIG_FILES(src/libcollectdclient/lcc_features.h)
 
-AC_OUTPUT(Makefile src/Makefile src/collectd.conf src/libcollectdclient/Makefile src/libcollectdclient/libcollectdclient.pc src/liboconfig/Makefile bindings/Makefile bindings/java/Makefile)
+AC_OUTPUT(Makefile src/Makefile src/collectd.conf src/libcollectdclient/Makefile src/libcollectdclient/libcollectdclient.pc src/liboconfig/Makefile bindings/Makefile bindings/java/Makefile contrib/Makefile)
 
 if test "x$with_librrd" = "xyes" \
 	&& test "x$librrd_threadsafe" != "xyes"
