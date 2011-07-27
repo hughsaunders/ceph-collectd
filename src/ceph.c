@@ -74,6 +74,13 @@ struct ceph_daemon
 	 * dset.ds		Dynamically allocated array of key/value pairs
 	 */
 	struct data_set_s dset;
+
+	int *pc_types;
+};
+
+enum perfcounter_type_d {
+	PERFCOUNTER_LONGRUNAVG = 0x4,
+	PERFCOUNTER_COUNTER = 0x8,
 };
 
 /** Array of daemons to monitor */
@@ -103,19 +110,27 @@ static void ceph_daemon_free(struct ceph_daemon *d)
 }
 
 static int ceph_daemon_add_ds_entry(struct ceph_daemon *d,
-				    const char *name, int type)
+				    const char *name, int pc_type)
 {
 	struct data_source_s *ds;
+	int *pc_types_new;
 	if (strlen(name) + 1 > DATA_MAX_NAME_LEN)
 		return -ENAMETOOLONG;
 	struct data_source_s *ds_array = realloc(d->dset.ds,
 		 sizeof(struct data_source_s) * (d->dset.ds_num + 1));
 	if (!ds_array)
 		return -ENOMEM;
+	pc_types_new = realloc(d->pc_types,
+		sizeof(int) * (d->dset.ds_num + 1));
+	if (!pc_types_new)
+		return -ENOMEM;
 	d->dset.ds = ds_array;
+	d->pc_types = pc_types_new;
+	d->pc_types[d->dset.ds_num] = pc_type;
 	ds = &ds_array[d->dset.ds_num++];
 	snprintf(ds->name, DATA_MAX_NAME_LEN, "%s", name);
-	ds->type = type;
+	ds->type = (pc_type & PERFCOUNTER_COUNTER) ?
+		DS_TYPE_COUNTER : DS_TYPE_GAUGE;
 	ds->min = NAN;
 	ds->max = NAN;
 	return 0;
@@ -201,13 +216,15 @@ static int ceph_config(oconfig_item_t *ci)
 typedef int (*node_handler_t)(void*, json_object*, const char*);
 
 /** Perform a depth-first traversal of the JSON parse tree,
- * calling node_handler at each leaf node.*/
+ * calling node_handler at each node.*/
 static int traverse_json_impl(json_object *jo, char *key, int max_key,
 			node_handler_t handler, void *handler_arg)
 {
 	struct json_object_iter iter;
 	int ret, plen, klen;
 
+	if (json_object_get_type(jo) != json_type_object)
+		return 0;
 	plen = strlen(key);
 	json_object_object_foreachC(jo, iter) {
 		klen = strlen(iter.key);
@@ -216,20 +233,16 @@ static int traverse_json_impl(json_object *jo, char *key, int max_key,
 		if (plen != 0)
 			strncat(key, ".", max_key); /* really should be strcat */
 		strncat(key, iter.key, max_key);
-		switch (json_object_get_type(iter.val)) {
-		case json_type_object:
+
+		ret = handler(handler_arg, iter.val, key);
+		if (ret == 1) {
 			ret = traverse_json_impl(iter.val, key, max_key,
 					    handler, handler_arg);
-			break;
-		case json_type_array:
-			ret = -ENOTSUP;
-			break;
-		default:
-			ret = handler(handler_arg, iter.val, key);
-			break;
 		}
-		if (ret)
+		else if (ret != 0) {
 			return ret;
+		}
+
 		key[plen] = '\0';
 	}
 	return 0;
@@ -252,17 +265,15 @@ static int node_handler_define_schema(void *arg, json_object *jo,
 				      const char *key)
 {
 	struct ceph_daemon *d = (struct ceph_daemon *)arg;
-
-	switch (json_object_get_type(jo)) {
-	case json_type_boolean:
-	case json_type_double:
-	case json_type_int:
-		DEBUG("ceph_daemon_add_ds_entry(d=%s,key=%s)",
-		      d->dset.type, key);
-		return ceph_daemon_add_ds_entry(d, key, DS_TYPE_GAUGE);
-	default:
-		return -ENOTSUP;
-	}
+	int pc_type;
+	if (json_object_get_type(jo) == json_type_object)
+		return 1;
+	else if (json_object_get_type(jo) != json_type_int)
+		return -EDOM;
+	pc_type = json_object_get_int(jo);
+	DEBUG("ceph_daemon_add_ds_entry(d=%s,key=%s,pc_type=%04x)",
+	      d->dset.type, key, pc_type);
+	return ceph_daemon_add_ds_entry(d, key, pc_type);
 }
 
 /** A set of values_t data that we build up in memory while parsing the JSON. */
@@ -272,35 +283,56 @@ struct values_tmp {
 	value_t values[0];
 };
 
-static value_t* get_matching_value(const struct data_set_s *dset,
+int get_matching_value(const struct data_set_s *dset,
 		   const char *name, value_t *values, int num_values)
 {
-	int i;
-	for (i = 0; i < num_values; ++i) {
-		if (strcmp(dset->ds[i].name, name) == 0) {
-			return values + i;
+	int idx;
+	for (idx = 0; idx < num_values; ++idx) {
+		if (strcmp(dset->ds[idx].name, name) == 0) {
+			return idx;
 		}
+		return idx;
 	}
-	return NULL;
+	return -1;
 }
 
 static int node_handler_fetch_data(void *arg, json_object *jo,
 				      const char *key)
 {
+	int idx;
 	value_t *uv;
 	struct values_tmp *vtmp = (struct values_tmp*)arg;
 
-	switch (json_object_get_type(jo)) {
-	case json_type_boolean:
-	case json_type_double:
-	case json_type_int:
-		uv = get_matching_value(&vtmp->d->dset, key,
-					 vtmp->values, vtmp->values_len);
-		uv->gauge = json_object_get_double(jo);
-		return 0;
-	default:
-		return -ENOTSUP;
+	idx = get_matching_value(&vtmp->d->dset, key,
+				 vtmp->values, vtmp->values_len);
+	if (idx == -1)
+		return 1;
+	uv = vtmp->values + idx;
+	if (vtmp->d->pc_types[idx] & PERFCOUNTER_LONGRUNAVG) {
+		json_object *avgcount, *sum; 
+		uint64_t avgcounti;
+		double sumd;
+		if (json_object_get_type(jo) != json_type_object)
+			return -EINVAL;
+		avgcount = json_object_object_get(jo, "avgcount");
+		sum = json_object_object_get(jo, "sum");
+		if ((!avgcount) || (!sum))
+			return -EINVAL;
+		avgcounti = json_object_get_int(avgcount);
+		if (avgcounti == 0)
+			avgcounti = 1;
+		sumd = json_object_get_int(sum);
+		uv->gauge = sumd / avgcounti;
 	}
+	else if (vtmp->d->pc_types[idx] & PERFCOUNTER_COUNTER) {
+		/* We use json_object_get_double here because anything > 32 
+		 * bits may get truncated by json_object_get_int */
+		uv->counter = json_object_get_double(jo);
+	}
+	else {
+		uv->gauge = json_object_get_double(jo);
+	}
+	return 0;
 }
 
 /******* network I/O *******/
