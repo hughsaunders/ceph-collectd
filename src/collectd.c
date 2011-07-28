@@ -36,6 +36,11 @@
 # include <statgrab.h>
 #endif
 
+static void ignore_sigchild(int signum)
+{
+	/* do nothing */
+}
+
 /*
  * Global variables
  */
@@ -513,7 +518,7 @@ int main (int argc, char **argv)
 	 * fork off child
 	 */
 	memset (&sig_chld_action, '\0', sizeof (sig_chld_action));
-	sig_chld_action.sa_handler = SIG_IGN;
+	sig_chld_action.sa_handler = ignore_sigchild;
 	sigaction (SIGCHLD, &sig_chld_action, NULL);
 
 	if (daemonize)
