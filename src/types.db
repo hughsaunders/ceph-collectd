@@ -178,6 +178,12 @@ vs_threads		value:GAUGE:0:65535
 # Cephtool plugin types
 #
 num_osds		                value:GAUGE:0:4294967295
+
+num_osds_in				value:GAUGE:0:4294967295
+num_osds_out                            value:GAUGE:0:4294967295
+num_osds_up                             value:GAUGE:0:4294967295
+num_osds_down                           value:GAUGE:0:4294967295
+
 num_pgs		                        value:GAUGE:0:4294967295
 
 num_pgs_active		                value:GAUGE:0:4294967295

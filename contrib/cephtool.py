@@ -82,6 +82,35 @@ def cephtool_read_pg_states(pg_json):
             values=[v]\
         ).dispatch()
 
+def cephtool_read_osd(osd_json):
+    num_in = 0
+    num_up = 0
+    total = 0
+    for osd in osd_json:
+        total = total + 1
+        if osd["in"] == 1:
+            num_in = num_in + 1 
+        if osd["up"] == 1:
+            num_up = num_up + 1 
+    collectd.Values(plugin="cephtool",\
+        type="num_osds_in",\
+        values=[num_in],\
+    ).dispatch()
+    collectd.Values(plugin="cephtool",\
+        type="num_osds_out",\
+        values=[total - num_in],\
+    ).dispatch()
+    collectd.Values(plugin="cephtool",\
+        type="num_osds_up",\
+        values=[num_up],\
+    ).dispatch()
+    collectd.Values(plugin="cephtool",\
+        type="num_osds_down",\
+        values=[total - num_up],\
+    ).dispatch()
+
+        
+
 def cephtool_read(data=None):
     osd_json = cephtool_get_json(["osd", "dump"])
     pg_json = cephtool_get_json(["pg", "dump"])
@@ -90,6 +119,7 @@ def cephtool_read(data=None):
         type='num_osds',\
         values=[len(osd_json["osds"])]\
     ).dispatch()
+    cephtool_read_osd(osd_json["osds"])
     # number of osds up
     # number of osds down
     # number of osds in
@@ -114,7 +144,6 @@ def cephtool_read(data=None):
         values=[len(pg_json["pg_stats"])]\
     ).dispatch()
     cephtool_read_pg_states(pg_json["pg_stats"])
-    # number of PGs in each state
     # number of monitors
     # number of monitors in quorum
     collectd.Values(plugin="cephtool",\
