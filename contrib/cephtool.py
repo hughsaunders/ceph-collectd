@@ -2,8 +2,8 @@ import collectd
 import json
 import os
 import random
-import subprocess
 import string
+import subprocess
 import sys
 import time
 
@@ -19,7 +19,7 @@ def cephtool_config(config):
             g_ceph_config = child.values[0]
     collectd.info("cephtool_config: g_cephtool_path='%s', g_ceph_config='%s'" % \
             (g_cephtool_path, g_ceph_config))
-    if g_cephtool_path == "": 
+    if g_cephtool_path == "":
         raise Exception("You must configure the path to cephtool.")
     if not os.path.exists(g_cephtool_path):
         raise Exception("Cannot locate cephtool. cephtool is configured as \
@@ -89,9 +89,9 @@ def cephtool_read_osd(osd_json):
     for osd in osd_json:
         total = total + 1
         if osd["in"] == 1:
-            num_in = num_in + 1 
+            num_in = num_in + 1
         if osd["up"] == 1:
-            num_up = num_up + 1 
+            num_up = num_up + 1
     collectd.Values(plugin="cephtool",\
         type="num_osds_in",\
         values=[num_in],\
@@ -108,8 +108,6 @@ def cephtool_read_osd(osd_json):
         type="num_osds_down",\
         values=[total - num_up],\
     ).dispatch()
-
-        
 
 def cephtool_read(data=None):
     osd_json = cephtool_get_json(["osd", "dump"])
@@ -179,6 +177,6 @@ def cephtool_read(data=None):
         type='num_monitors_in_quorum',\
         values=[len(mon_json["quorum"])],
     ).dispatch()
-    
+
 collectd.register_config(cephtool_config)
 collectd.register_read(cephtool_read)
