@@ -1,0 +1,59 @@
+LoadPlugin logfile
+<Plugin "logfile">
+        LogLevel "debug"
+        File "/opt/collectd/var/log/collectd.log"
+        Timestamp true
+</Plugin>
+
+LoadPlugin python
+<Plugin python>
+        ModulePath "/opt/collectd/lib/python2.6/site-packages/"
+        LogTraces true
+        Import "cephtool"
+        <Module "cephtool">
+                cephtool "/home/cmccabe/ceph/src/ceph"
+                config "/home/cmccabe/ceph/src/ceph.conf"
+        </Module>
+</Plugin>
+
+LoadPlugin ceph
+<Plugin ceph>
+        Name "osd.0"
+        SocketPath "/home/cmccabe/ceph/src/out/asok.osd.0"
+</Plugin>
+
+<Plugin ceph>
+        Name "mds.a"
+        SocketPath "/home/cmccabe/ceph/src/out/asok.mds.a"
+</Plugin>
+
+<Plugin ceph>
+        Name "mds.b"
+        SocketPath "/home/cmccabe/ceph/src/out/asok.mds.b"
+</Plugin>
+
+<Plugin ceph>
+        Name "mds.c"
+        SocketPath "/home/cmccabe/ceph/src/out/asok.mds.c"
+</Plugin>
+
+<Plugin ceph>
+        Name "mon.a"
+        SocketPath "/home/cmccabe/ceph/src/out/asok.mon.a"
+</Plugin>
+
+<Plugin ceph>
+        Name "mon.b"
+        SocketPath "/home/cmccabe/ceph/src/out/asok.mon.b"
+</Plugin>
+
+<Plugin ceph>
+        Name "mon.c"
+        SocketPath "/home/cmccabe/ceph/src/out/asok.mon.c"
+</Plugin>
+
+LoadPlugin csv
+<Plugin "csv">
+        DataDir "/opt/collectd/var/log/output.log"
+        StoreRates true
+</Plugin>

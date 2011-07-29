@@ -1,0 +1,58 @@
+LoadPlugin logfile
+<Plugin "logfile">
+        LogLevel "warning"
+        File "/var/log/collectd.log"
+        Timestamp true
+</Plugin>
+
+LoadPlugin python
+<Plugin python>
+        ModulePath "/lib/python2.6/site-packages/"
+        Import "cephtool"
+        <Module "cephtool">
+                cephtool "/usr/bin/ceph"
+                config "/etc/ceph/ceph.conf"
+        </Module>
+</Plugin>
+
+LoadPlugin ceph
+<Plugin ceph>
+        Name "osd.0"
+        SocketPath "/var/run/ceph/osd.0.asok"
+</Plugin>
+
+<Plugin ceph>
+        Name "mds.a"
+        SocketPath "/var/run/ceph/mds.a.asok"
+</Plugin>
+
+<Plugin ceph>
+        Name "mds.b"
+        SocketPath "/var/run/ceph/mds.b.asok"
+</Plugin>
+
+<Plugin ceph>
+        Name "mds.c"
+        SocketPath "/var/run/ceph/mds.c.asok"
+</Plugin>
+
+<Plugin ceph>
+        Name "mon.a"
+        SocketPath "/var/run/ceph/mon.a.asok"
+</Plugin>
+
+<Plugin ceph>
+        Name "mon.b"
+        SocketPath "/var/run/ceph/mon.b.asok"
+</Plugin>
+
+<Plugin ceph>
+        Name "mon.c"
+        SocketPath "/var/run/ceph/mon.c.asok"
+</Plugin>
+
+LoadPlugin csv
+<Plugin "csv">
+        DataDir "/var/log/collectd"
+        StoreRates true
+</Plugin>
