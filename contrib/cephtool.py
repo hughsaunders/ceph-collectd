@@ -114,6 +114,7 @@ def cephtool_read_osd(osd_json):
 def cephtool_read(data=None):
     osd_json = cephtool_get_json(["osd", "dump"])
     pg_json = cephtool_get_json(["pg", "dump"])
+    mon_json = cephtool_get_json(["mon", "dump"])
 
     collectd.Values(plugin="cephtool",\
         type='num_osds',\
@@ -169,8 +170,15 @@ def cephtool_read(data=None):
         type='num_objects_unfound',\
         values=[pg_json["pg_stats_sum"]["num_objects_unfound"]]\
     ).dispatch()
-    # number of monitors
-    # number of monitors in quorum
 
+    collectd.Values(plugin="cephtool",\
+        type='num_monitors',\
+        values=[len(mon_json["mons"])],
+    ).dispatch()
+    collectd.Values(plugin="cephtool",\
+        type='num_monitors_in_quorum',\
+        values=[len(mon_json["quorum"])],
+    ).dispatch()
+    
 collectd.register_config(cephtool_config)
 collectd.register_read(cephtool_read)
