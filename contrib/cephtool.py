@@ -33,25 +33,34 @@ def cephtool_subprocess(more_args):
     proc = subprocess.Popen(args, shell=False, stdout=subprocess.PIPE)
     return proc.communicate()[0]
 
-def cephtool_read(data=None):
-    info = cephtool_subprocess(["osd", "dump"])
+def cephtool_get_json(more_args):
+    info = cephtool_subprocess(more_args)
     lines = info.splitlines()
     first_json_line = -1
     line_idx = 0
     for line in lines:
-        if ((len(line) > 0) and (line[0] == '{')):
+        if ((len(line) > 0) and ((line[0] == '{') or (line[0] == '['))):
             first_json_line = line_idx
             break
         line_idx = line_idx + 1
     if (first_json_line == -1):
         raise Exception("failed to find the first JSON line in the output!")
     jsonstr = "".join(lines[first_json_line:])
-    j = json.loads(jsonstr)
+    return json.loads(jsonstr)
 
+def cephtool_read(data=None):
+    osd_json = cephtool_get_json(["osd", "dump"])
     collectd.Values(plugin="cephtool",\
         type='num_osds',\
-        values=[len(j["osds"])]\
+        values=[len(osd_json["osds"])]\
     ).dispatch()
+
+    pg_json = cephtool_get_json(["pg", "dump"])
+    collectd.Values(plugin="cephtool",\
+        type='num_pgs',\
+        values=[len(pg_json)]\
+    ).dispatch()
+    
 
 collectd.register_config(cephtool_config)
 collectd.register_read(cephtool_read)
