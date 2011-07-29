@@ -50,17 +50,50 @@ def cephtool_get_json(more_args):
 
 def cephtool_read(data=None):
     osd_json = cephtool_get_json(["osd", "dump"])
+    pg_json = cephtool_get_json(["pg", "dump"])
+
     collectd.Values(plugin="cephtool",\
         type='num_osds',\
         values=[len(osd_json["osds"])]\
     ).dispatch()
-
-    pg_json = cephtool_get_json(["pg", "dump"])
+    # number of osds up
+    # number of osds down
+    # number of osds in
+    # number of osds out
+    # df info: total disk available
+    # df info: total disk used
+    # df info: total disk free
+    collectd.Values(plugin="cephtool",\
+        type='num_pools',\
+        values=[len(pg_json["pool_stats"])]\
+    ).dispatch()
+    collectd.Values(plugin="cephtool",\
+        type='num_objects',\
+        values=[pg_json["pg_stats_sum"]["num_objects"]]\
+    ).dispatch()
+    collectd.Values(plugin="cephtool",\
+        type='num_bytes',\
+        values=[pg_json["pg_stats_sum"]["num_bytes"]]\
+    ).dispatch()
     collectd.Values(plugin="cephtool",\
         type='num_pgs',\
-        values=[len(pg_json)]\
+        values=[len(pg_json["pg_stats"])]\
     ).dispatch()
-    
+    # number of PGs in each state
+    # number of monitors
+    # number of monitors in quorum
+    collectd.Values(plugin="cephtool",\
+        type='num_objects_missing_on_primary',\
+        values=[pg_json["pg_stats_sum"]["num_objects_missing_on_primary"]]\
+    ).dispatch()
+    collectd.Values(plugin="cephtool",\
+        type='num_objects_degraded',\
+        values=[pg_json["pg_stats_sum"]["num_objects_degraded"]]\
+    ).dispatch()
+    collectd.Values(plugin="cephtool",\
+        type='num_objects_unfound',\
+        values=[pg_json["pg_stats_sum"]["num_objects_unfound"]]\
+    ).dispatch()
 
 collectd.register_config(cephtool_config)
 collectd.register_read(cephtool_read)
