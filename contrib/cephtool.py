@@ -3,6 +3,7 @@ import json
 import os
 import random
 import subprocess
+import string
 import sys
 import time
 
@@ -48,6 +49,39 @@ def cephtool_get_json(more_args):
     jsonstr = "".join(lines[first_json_line:])
     return json.loads(jsonstr)
 
+def cephtool_read_pg_states(pg_json):
+    stateinfo = {
+        "active" : 0,
+        "clean" : 0,
+        "crashed" : 0,
+        "creating" : 0,
+        "degraded" : 0,
+        "down" : 0,
+        "inconsistent" : 0,
+        "peering" : 0,
+        "repair" : 0,
+        "replay" : 0,
+        "scanning" : 0,
+        "scrubbing" : 0,
+        "scrubq" : 0,
+        "splitting" : 0,
+        "stray" : 0,
+    }
+    for pg in pg_json:
+        state = pg["state"]
+        slist = string.split(state, "+")
+        for s in slist:
+            if not s in stateinfo:
+                collectd.error("PG %s has unknown state %s" % \
+                    (pg_json["pgid"], s))
+            else:
+                stateinfo[s] = stateinfo[s] + 1
+    for k,v in stateinfo.items():
+        collectd.Values(plugin="cephtool",\
+            type=('num_pgs_' + k),\
+            values=[v]\
+        ).dispatch()
+
 def cephtool_read(data=None):
     osd_json = cephtool_get_json(["osd", "dump"])
     pg_json = cephtool_get_json(["pg", "dump"])
@@ -79,6 +113,7 @@ def cephtool_read(data=None):
         type='num_pgs',\
         values=[len(pg_json["pg_stats"])]\
     ).dispatch()
+    cephtool_read_pg_states(pg_json["pg_stats"])
     # number of PGs in each state
     # number of monitors
     # number of monitors in quorum
