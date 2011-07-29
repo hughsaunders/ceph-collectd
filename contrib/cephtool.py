@@ -120,13 +120,31 @@ def cephtool_read(data=None):
         values=[len(osd_json["osds"])]\
     ).dispatch()
     cephtool_read_osd(osd_json["osds"])
-    # number of osds up
-    # number of osds down
-    # number of osds in
-    # number of osds out
-    # df info: total disk available
-    # df info: total disk used
-    # df info: total disk free
+
+    collectd.Values(plugin="cephtool",\
+        type='osd_stats_kb_used',\
+        values=[pg_json["osd_stats_sum"]["kb_used"]]\
+    ).dispatch()
+    collectd.Values(plugin="cephtool",\
+        type='osd_stats_kb_avail',\
+        values=[pg_json["osd_stats_sum"]["kb_avail"]]\
+    ).dispatch()
+    collectd.Values(plugin="cephtool",\
+        type='osd_stats_snap_trim_queue_len',\
+        values=[pg_json["osd_stats_sum"]["snap_trim_queue_len"]]\
+    ).dispatch()
+    collectd.Values(plugin="cephtool",\
+        type='osd_stats_num_snap_trimming',\
+        values=[pg_json["osd_stats_sum"]["num_snap_trimming"]]\
+    ).dispatch()
+
+    collectd.Values(plugin="cephtool",\
+        type='num_pgs',\
+        values=[len(pg_json["pg_stats"])]\
+    ).dispatch()
+
+    cephtool_read_pg_states(pg_json["pg_stats"])
+
     collectd.Values(plugin="cephtool",\
         type='num_pools',\
         values=[len(pg_json["pool_stats"])]\
@@ -136,16 +154,9 @@ def cephtool_read(data=None):
         values=[pg_json["pg_stats_sum"]["num_objects"]]\
     ).dispatch()
     collectd.Values(plugin="cephtool",\
-        type='num_bytes',\
+        type='pg_stats_sum_num_bytes',\
         values=[pg_json["pg_stats_sum"]["num_bytes"]]\
     ).dispatch()
-    collectd.Values(plugin="cephtool",\
-        type='num_pgs',\
-        values=[len(pg_json["pg_stats"])]\
-    ).dispatch()
-    cephtool_read_pg_states(pg_json["pg_stats"])
-    # number of monitors
-    # number of monitors in quorum
     collectd.Values(plugin="cephtool",\
         type='num_objects_missing_on_primary',\
         values=[pg_json["pg_stats_sum"]["num_objects_missing_on_primary"]]\
@@ -158,6 +169,8 @@ def cephtool_read(data=None):
         type='num_objects_unfound',\
         values=[pg_json["pg_stats_sum"]["num_objects_unfound"]]\
     ).dispatch()
+    # number of monitors
+    # number of monitors in quorum
 
 collectd.register_config(cephtool_config)
 collectd.register_read(cephtool_read)
