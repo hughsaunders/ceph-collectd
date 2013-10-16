@@ -114,10 +114,76 @@ def cephtool_read_osd(osd_json):
         values=[total - num_up],\
     ).dispatch()
 
+
+def cephtool_read_pools(osd_json, pg_json, df_json):
+    """Collect per pool metrics"""
+    pools = osd_json['pools']
+    dfs = df_json
+    pgs = pg_json['pg_stats']
+    osds = pg_json['osd_stats']
+
+    # Get pool disk usage information from ceph df
+    for df in dfs['pools']:
+        pool = filter(lambda x: x['pool'] == df['id'], pools)[0]
+        pool['pool_stored'] = df['stats']['kb_used']
+        pool['pool_used'] = pool['pool_stored'] * pool['size']
+
+        # Clear stored minumums so that increases in OSD space are recognised
+        if 'osd_available_min' in pool:
+            del pool['osd_available_min']
+
+    # Add OSD space free/available information to each pool
+    for pg in pgs:
+        pgid = pg['pgid']
+        acting = pg['acting']
+        pool_num, pg = pgid.split('.')
+        pool_num = int(pool_num)
+        pool = filter(lambda x: x['pool'] == pool_num, pools)[0]
+
+        for osd_id in acting:
+            osd = filter(lambda x: x['osd'] == osd_id, osds)[0]
+            if 'OSDs' not in pool:
+                pool['OSDs'] = set()
+            if 'osd_total' not in pool:
+                pool['osd_total'] = 0
+            if 'osd_available' not in pool:
+                pool['osd_available'] = 0
+
+            if osd_id not in pool['OSDs']:
+                pool['OSDs'].add(osd_id)
+                pool['osd_total'] += (osd['kb_used'] + osd['kb_avail'])
+                pool['osd_available'] += osd['kb_avail']
+
+            if ('osd_available_min' not in pool
+                    or osd['kb_avail'] < pool['osd_available_min']):
+                pool['osd_available_min'] = osd['kb_avail']
+
+    # Add calculated values
+    for pool in pools:
+        pool['pool_max'] = pool['osd_total'] / pool['size']
+        pool['pool_available'] = pool['osd_available']/pool['size']
+        pool['pool_percent'] = (float(pool['pool_used']) /
+                                (pool['pool_used'] +
+                                 pool['osd_available'])) * 100
+
+        # Report all the pool's numeric properties as collectd metrics.
+        for key, value in pool.iteritems():
+            if not isinstance(value, (float, int, long)):
+                continue
+            collectd.Values(plugin="ceph.pool.%s" % pool['pool_name'],
+                            type='gauge',
+                            type_instance=key,
+                            values=[value]
+                            ).dispatch()
+
+
 def cephtool_read(data=None):
     osd_json = cephtool_get_json(["osd", "dump"])
     pg_json = cephtool_get_json(["pg", "dump"])
     mon_json = cephtool_get_json(["mon", "dump"])
+    df_json = cephtool_get_json(["df"])
+
+    cephtool_read_pools(osd_json, pg_json, df_json)
 
     collectd.Values(plugin="ceph.osd",\
         type='gauge',\
