@@ -176,6 +176,17 @@ def cephtool_read_pools(osd_json, pg_json, df_json):
                             values=[value]
                             ).dispatch()
 
+        for osd_id in pool['OSDs']:
+            osd = filter(lambda x: x['osd'] == osd_id, osds)[0]
+            for key, value in osd.iteritems():
+                if not isinstance(value, (float, int, long)):
+                    continue
+                collectd.Values(plugin="ceph.pool.%s.osds.%i" % (pool['pool_name'], osd_id),
+                                type='gauge',
+                                type_instance=key,
+                                values=[value]
+                                ).dispatch()
+
 
 def cephtool_read(data=None):
     osd_json = cephtool_get_json(["osd", "dump"])
