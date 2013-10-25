@@ -165,6 +165,7 @@ def cephtool_read_pools(osd_json, pg_json, df_json):
         pool['pool_percent'] = (float(pool['pool_used']) /
                                 (pool['pool_used'] +
                                  pool['osd_available'])) * 100
+        pool['pool_name'] = pool['pool_name'].replace(".","_")
 
         # Report all the pool's numeric properties as collectd metrics.
         for key, value in pool.iteritems():
