@@ -166,6 +166,7 @@ def cephtool_read_pools(osd_json, pg_json, df_json):
                                 (pool['pool_used'] +
                                  pool['osd_available'])) * 100
         pool['pool_name'] = pool['pool_name'].replace(".","_")
+        pool['recommended_pg_num'] = (len(osd_json["osds"]) * 100) / pool['size']
 
         # Report all the pool's numeric properties as collectd metrics.
         for key, value in pool.iteritems():
@@ -229,6 +230,11 @@ def cephtool_read(data=None):
         type="gauge",\
         type_instance='num_pgs',\
         values=[len(pg_json["pg_stats"])]\
+    ).dispatch()
+    collectd.Values(plugin="ceph.pg",\
+        type="gauge",\
+        type_instance='num_pgs_per_osd',\
+        values=[len(pg_json["pg_stats"]) / len(osd_json["osds"])]\
     ).dispatch()
 
     cephtool_read_pg_states(pg_json["pg_stats"])
